@@ -197,7 +197,7 @@ class QuoteStore:
     PLUGIN_NAME,
     "Codex",
     "提交语录并生成带头像的语录图片",
-    "0.1.1",
+    "0.2.0",
     "https://example.com/astrbot-plugin-quotes",
 )
 class QuotesPlugin(Star):
@@ -273,11 +273,11 @@ class QuotesPlugin(Star):
 
         # 收集图片（被回复消息 + 当前消息链），按群分目录
         group_key = str(event.get_group_id() or f"private_{event.get_sender_id()}")
-        images: List[str] = []
+        images_from_reply: List[str] = []
         if event.get_platform_name() == "aiocqhttp" and ret:
-            images += await self._ingest_images_from_onebot_message(event, ret.get("message"), group_key)
-        images += await self._ingest_images_from_segments(event, group_key)
-        images = list(dict.fromkeys(images))
+            images_from_reply = await self._ingest_images_from_onebot_message(event, ret.get("message"), group_key)
+        images_from_current: List[str] = await self._ingest_images_from_segments(event, group_key)
+        images: List[str] = list(dict.fromkeys(images_from_reply + images_from_current))
 
         # 统一剔除 @提及（例如：@昵称(123456789)、@昵称、@全体成员）
         target_text = self._strip_at_tokens(target_text or "") or ""
@@ -289,10 +289,19 @@ class QuotesPlugin(Star):
         if not target_text and images:
             target_text = "[图片]"
 
-        # 名称/QQ 兜底
-        if not target_qq:
-            # 从 @ 中兜底（如平台未提供 get_msg 时）
-            target_qq = self._extract_at_qq(event) or ""
+        # 名称/QQ 归属规则：
+        # - 如果本条消息“自己上传了图片”（images_from_current 非空）：
+        #     · 若@了某人，则语录归属该@用户。
+        #     · 否则，语录归属为上传者本人（event.get_sender_id()）。
+        # - 否则（未上传图片，仅回复他人）：
+        #     · 优先使用被回复消息的发送者（target_qq）。
+        #     · 若无，则回退到本条消息的@对象。
+        mention_qq = self._extract_at_qq(event)
+        if images_from_current:
+            target_qq = str(mention_qq or event.get_sender_id())
+        else:
+            target_qq = str(target_qq or (mention_qq or ""))
+
         if not target_name:
             target_name = await self._resolve_user_name(event, target_qq) if target_qq else ""
         if not target_name:
@@ -467,8 +476,8 @@ class QuotesPlugin(Star):
         """显示语录相关指令的使用说明。"""
         help_text = (
             "语录插件帮助\n"
-            "- 上传：先回复某人的消息，再发送“上传”（可附带图片）保存为语录。\n"
-            "- 语录：随机发送一条语录；若含用户上传图片，将直接发送原图。\n"
+            "- 上传：先回复某人的消息，再发送“上传”（可附带图片）保存为语录。可在消息中 @某人 指定图片语录归属；不@则默认归属上传者。\n"
+            "- 语录：随机发送一条语录；可用“语录 @某人”仅随机该用户的语录；若含用户上传图片，将直接发送原图。\n"
             "- 删除：回复机器人刚发送的随机语录消息，发送“删除”或“删除语录”进行删除。"
         )
         yield event.plain_result(help_text)
