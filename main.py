@@ -5,6 +5,7 @@ import json
 import random
 import re
 import html
+import base64
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -167,7 +168,7 @@ class QuoteStore:
             return True
 
     async def get_avatar_uri(self, qq: str, enable_cache: bool = True) -> str:
-        """返回头像的本地 file:// URI（若已缓存或成功下载），否则返回 qlogo 远程 URL。"""
+        """返回头像的 data:URI（若已缓存或成功下载）；否则返回 qlogo 远程 URL。"""
         size = 640
         remote = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s={size}"
         if not enable_cache:
@@ -175,19 +176,23 @@ class QuoteStore:
         try:
             p = self.avatars_dir / f"{qq}.png"
             if p.exists():
-                return p.as_uri()
+                data = p.read_bytes()
+                b64 = base64.b64encode(data).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+            # 下载并落盘，再返回 dataURI
             if self._http is None:
                 import httpx
                 async with httpx.AsyncClient(timeout=20) as client:
                     resp = await client.get(remote)
                     resp.raise_for_status()
-                    p.write_bytes(resp.content)
-                    return p.as_uri()
+                    content = resp.content
             else:
                 resp = await self._http.get(remote)
                 resp.raise_for_status()
-                p.write_bytes(resp.content)
-                return p.as_uri()
+                content = resp.content
+            p.write_bytes(content)
+            b64 = base64.b64encode(content).decode("ascii")
+            return f"data:image/png;base64,{b64}"
         except Exception as e:
             logger.info(f"头像缓存失败，回退远程: {e}")
             return remote
