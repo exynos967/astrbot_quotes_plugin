@@ -162,6 +162,9 @@ class QuotesPlugin(Star):
         self.store = QuoteStore(data_root)
         self.avatar_provider = (self.config.get("avatar_provider") or "qlogo").lower()
         self.img_cfg = (self.config.get("image") or {})
+        # 发送记录：避免在消息中暴露 qid，通过会话最近记录辅助删除
+        self._pending_qid: Dict[str, str] = {}
+        self._last_sent_qid: Dict[str, str] = {}
 
     async def initialize(self):
         """可选：异步初始化。"""
@@ -272,14 +275,16 @@ class QuotesPlugin(Star):
     @filter.command("语录", alias={"名言"})
     async def random_quote(self, event: AstrMessageEvent):
         """随机发送一条语录：
-        - 若该语录含用户上传图片，直接发送原图（不经渲染），并附带内部标记以支持删除。
-        - 若不含图片，则按原逻辑渲染语录图片，并附带内部标记以支持删除。
+        - 若该语录含用户上传图片，直接发送原图（不经渲染）。
+        - 若不含图片，则按原逻辑渲染语录图片。
         也可用：/quote random
         """
         q = await self.store.random_one()
         if not q:
             yield event.plain_result("还没有语录，先用 /quote add 添加一条吧~")
             return
+        # 在不暴露 qid 的前提下，记录待发送的 qid（会在 after_message_sent 钩子中落到 _last_sent_qid）
+        self._pending_qid[self._session_key(event)] = q.id
         # 优先发送原图
         if getattr(q, "images", None):
             try:
@@ -290,17 +295,13 @@ class QuotesPlugin(Star):
                 if abs_path.exists():
                     yield event.chain_result([
                         Comp.Image.fromFileSystem(str(abs_path)),
-                        Comp.Plain(self._qid_tag(q.id)),
                     ])
                     return
             except Exception as e:
                 logger.info(f"随机原图发送失败，回退渲染：{e}")
         # 回退：渲染语录图
         img_url = await self._render_quote_image(q)
-        yield event.chain_result([
-            Comp.Image.fromURL(img_url),
-            Comp.Plain(self._qid_tag(q.id)),
-        ])
+        yield event.image_result(img_url)
 
     @quote.command("random")
     async def random_quote_cmd(self, event: AstrMessageEvent):
@@ -327,6 +328,9 @@ class QuotesPlugin(Star):
             pass
         return None
 
+    def _session_key(self, event: AstrMessageEvent) -> str:
+        return str(event.get_group_id() or event.unified_msg_origin)
+
     @filter.command("删除", alias={"删除语录"})
     async def delete_quote(self, event: AstrMessageEvent):
         """删除语录：请『回复机器人发送的语录』并发送“删除”来删除该语录。"""
@@ -350,7 +354,7 @@ class QuotesPlugin(Star):
             yield event.plain_result("请先『回复机器人发送的语录』，再发送 删除。")
             return
 
-        # 拉取被回复消息内容，解析 [qid:...] 标记
+        # 拉取被回复消息内容，解析 [qid:...] 标记（兼容旧消息）
         qid: Optional[str] = None
         if event.get_platform_name() == "aiocqhttp":
             try:
@@ -359,15 +363,28 @@ class QuotesPlugin(Star):
                 qid = self._extract_qid_from_onebot_message(ret.get("message"))
             except Exception as e:
                 logger.info(f"读取被回复消息失败：{e}")
+        # 新版消息（不带任何文本标记）回退：删除当前会话最近一次随机发送的语录
         if not qid:
-            yield event.plain_result("未从被引用消息中找到语录标记（可能是旧消息）。请重新随机语录后再执行 删除。")
+            qid = self._last_sent_qid.get(self._session_key(event))
+        if not qid:
+            yield event.plain_result("未能定位语录，请先重新发送一次随机语录再尝试删除。")
             return
 
         ok = await self.store.delete_by_id(qid)
         if ok:
-            yield event.plain_result(f"已删除语录（ID={qid}）。")
+            yield event.plain_result("已删除语录。")
         else:
             yield event.plain_result("未找到该语录，可能已被删除。")
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        try:
+            key = self._session_key(event)
+            qid = self._pending_qid.pop(key, None)
+            if qid:
+                self._last_sent_qid[key] = qid
+        except Exception as e:
+            logger.info(f"after_message_sent 记录失败: {e}")
 
     # ============= 内部方法 =============
     def _extract_at_qq(self, event: AstrMessageEvent) -> Optional[str]:
