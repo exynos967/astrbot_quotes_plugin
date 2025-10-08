@@ -174,9 +174,9 @@ class QuotesPlugin(Star):
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
-        # 使用 StarTools 获取插件专属数据目录（data/plugin_data/quotes）
-        tools = self.get_tools()
-        data_root = tools.get_data_dir()
+        # 规范化数据目录：优先使用配置 storage；否则使用 data/plugin_data/<plugin_name>
+        storage = str(self.config.get("storage") or "").strip()
+        data_root = Path(storage) if storage else (Path.cwd() / "data" / "plugin_data" / PLUGIN_NAME)
         # 复用 httpx 客户端，避免频繁创建销毁
         try:
             import httpx  # type: ignore
