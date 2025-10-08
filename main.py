@@ -62,10 +62,10 @@ class QuoteStore:
             self._quotes = []
 
     def images_rel(self, filename: str, group_key: Optional[str] = None) -> str:
-        """返回相对 data 目录的路径，按群分目录：quotes/images/<group_key>/<filename>。"""
+        """返回相对插件数据根目录的路径，按群分目录：images/<group_key>/<filename>。"""
         if group_key:
-            return f"quotes/images/{group_key}/{filename}"
-        return f"quotes/images/{filename}"
+            return f"images/{group_key}/{filename}"
+        return f"images/{filename}"
 
     def images_abs(self, filename: str, group_key: Optional[str] = None) -> Path:
         base = self.images_dir / group_key if group_key else self.images_dir
@@ -352,13 +352,15 @@ class QuotesPlugin(Star):
         if getattr(q, "images", None):
             try:
                 rel = random.choice(q.images)
-                # 兼容相对/绝对路径
+                # 兼容相对/绝对路径；兼容旧数据（以 quotes/images 开头）
                 p = Path(rel)
                 abs_path = p if p.is_absolute() else (self.store.root / rel)
+                if not abs_path.exists() and isinstance(rel, str) and rel.startswith("quotes/"):
+                    # 旧存储相对路径修正：去掉前缀 quotes/
+                    fixed = rel.split("/", 1)[1] if "/" in rel else rel
+                    abs_path = self.store.root / fixed
                 if abs_path.exists():
-                    yield event.chain_result([
-                        Comp.Image.fromFileSystem(str(abs_path)),
-                    ])
+                    yield event.chain_result([Comp.Image.fromFileSystem(str(abs_path))])
                     return
             except Exception as e:
                 logger.info(f"随机原图发送失败，回退渲染：{e}")
