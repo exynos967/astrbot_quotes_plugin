@@ -4,6 +4,7 @@ import asyncio
 import json
 import random
 import re
+import html
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,18 +36,18 @@ class Quote:
 
 
 class QuoteStore:
-    """简易 JSON 存储，保存于 data/quotes/quotes.json。
-    - 遵循 AstrBot 插件规范：数据写入 data 目录，而非插件自身目录
+    """简易 JSON 存储，保存于插件专属数据目录（data/plugin_data/quotes/）。
+    - 遵循 AstrBot 插件规范：通过 StarTools.get_data_dir 获取根目录
     - 通过 asyncio.Lock 简单串行化写入，避免并发写入冲突
     """
 
-    def __init__(self, root_data_dir: Path):
+    def __init__(self, root_data_dir: Path, http_client: Optional[Any] = None):
         self.root = Path(root_data_dir)
-        self.dir = self.root / "quotes"
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.images_dir = self.dir / "images"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.images_dir = self.root / "images"
         self.images_dir.mkdir(parents=True, exist_ok=True)
-        self.file = self.dir / "quotes.json"
+        self.file = self.root / "quotes.json"
+        self._http = http_client
         self._lock = asyncio.Lock()
         if not self.file.exists():
             self._write({"quotes": []})
@@ -65,30 +66,36 @@ class QuoteStore:
     async def save_image_from_url(self, url: str, group_key: Optional[str] = None) -> Optional[str]:
         """下载网络图片并保存，返回相对 data 的路径。按群分目录。"""
         try:
-            import httpx  # 轻量异步 HTTP 客户端
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                # 猜扩展名
+            if self._http is None:
+                # 延迟创建，保证在未注入 client 时也可工作
+                import httpx
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(url)
+                    content = resp.content
+                    ct = (resp.headers.get("Content-Type") or "").lower()
+            else:
+                resp = await self._http.get(url)
+                content = resp.content
                 ct = (resp.headers.get("Content-Type") or "").lower()
-                ext = ".jpg"
-                if "png" in ct:
-                    ext = ".png"
-                elif "webp" in ct:
-                    ext = ".webp"
-                elif "gif" in ct:
-                    ext = ".gif"
-                # 从 url 推断
-                from urllib.parse import urlparse
-                p = urlparse(url)
-                name_guess = Path(p.path).name
-                if "." in name_guess and len(Path(name_guess).suffix) <= 5:
-                    ext = Path(name_guess).suffix
-                from time import time
-                filename = f"{int(time()*1000)}_{random.randint(1000,9999)}{ext}"
-                abs_path = self.images_abs(filename, group_key)
-                abs_path.write_bytes(resp.content)
-                return self.images_rel(filename, group_key)
+            # 猜扩展名
+            ext = ".jpg"
+            if "png" in ct:
+                ext = ".png"
+            elif "webp" in ct:
+                ext = ".webp"
+            elif "gif" in ct:
+                ext = ".gif"
+            # 从 url 推断
+            from urllib.parse import urlparse
+            p = urlparse(url)
+            name_guess = Path(p.path).name
+            if "." in name_guess and len(Path(name_guess).suffix) <= 5:
+                ext = Path(name_guess).suffix
+            from time import time
+            filename = f"{int(time()*1000)}_{random.randint(1000,9999)}{ext}"
+            abs_path = self.images_abs(filename, group_key)
+            abs_path.write_bytes(content)
+            return self.images_rel(filename, group_key)
         except Exception as e:
             logger.warning(f"下载图片失败: {e}")
             return None
@@ -167,11 +174,16 @@ class QuotesPlugin(Star):
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
-        # 推断 data 根目录：优先配置项 storage；其次猜测从默认 data 目录
-        storage = str(self.config.get("storage", "") or "").strip()
-        # 优先使用 AstrBot 进程工作目录下的 data 目录
-        data_root = Path(storage) if storage else Path.cwd() / "data"
-        self.store = QuoteStore(data_root)
+        # 使用 StarTools 获取插件专属数据目录（data/plugin_data/quotes）
+        tools = self.get_tools()
+        data_root = tools.get_data_dir()
+        # 复用 httpx 客户端，避免频繁创建销毁
+        try:
+            import httpx  # type: ignore
+            self.http_client = httpx.AsyncClient(timeout=20)
+        except Exception:
+            self.http_client = None
+        self.store = QuoteStore(data_root, http_client=self.http_client)
         self.avatar_provider = (self.config.get("avatar_provider") or "qlogo").lower()
         self.img_cfg = (self.config.get("image") or {})
         # 发送记录：避免在消息中暴露 qid，通过会话最近记录辅助删除
@@ -190,47 +202,26 @@ class QuotesPlugin(Star):
 
     # @quote.command("add", alias={"append"})  # disabled: use 顶层指令“上传”
     async def add_quote(self, event: AstrMessageEvent):
-        """添加语录。新版用法：先『回复某人的消息』，再发送 /quote add（别名：/语录提交 或 /语录添加）
-        注意：会自动剔除被回复文本中的 @提及（包括昵称与QQ号），防止把 @内容渲染进语录图。"""
-        # 优先从消息链中提取 Reply 段，拿到被回复消息的 message_id
-        reply_msg_id: Optional[str] = None
-        try:
-            for seg in event.get_messages():  # type: ignore[attr-defined]
-                if isinstance(seg, Comp.Reply):
-                    reply_msg_id = (
-                        getattr(seg, "message_id", None)
-                        or getattr(seg, "id", None)
-                        or getattr(seg, "reply", None)
-                        or getattr(seg, "msgId", None)
-                    )
-                    if reply_msg_id:
-                        break
-        except Exception as e:
-            logger.warning(f"解析 Reply 段失败: {e}")
-
+        """添加语录（上传）。新版用法：先『回复某人的消息』，再发送“上传”。
+        会自动剔除被回复文本中的 @ 提及，避免渲染进语录图。"""
+        # 1) 解析被回复消息 ID
+        reply_msg_id = self._get_reply_message_id(event)
         if not reply_msg_id:
-            yield event.plain_result("请先『回复某人的消息』，再发送 /quote add。")
+            yield event.plain_result("请先『回复某人的消息』，再发送 上传。")
             return
 
-        # 通过 Napcat/OneBot get_msg 拉取被回复消息内容与发送者
+        # 2) 拉取被回复消息内容与发送者
         target_text: Optional[str] = None
         target_qq: Optional[str] = None
         target_name: Optional[str] = None
-        ret: Dict[str, Any] = {}
-        if event.get_platform_name() == "aiocqhttp": 
-            try:
-                client = event.bot
-                ret = await client.api.call_action("get_msg", message_id=int(str(reply_msg_id)))
-                # 提取纯文本
-                target_text = self._extract_plaintext_from_onebot_message(ret.get("message"))
-                # 发送者
-                sender = ret.get("sender") or {}
-                target_qq = str(sender.get("user_id") or sender.get("qq") or "") or None
-                card = (sender.get("card") or "").strip()
-                nickname = (sender.get("nickname") or "").strip()
-                target_name = card or nickname or target_qq
-            except Exception as e:
-                logger.info(f"get_msg 失败，回退：{e}")
+        ret: Dict[str, Any] = await self._fetch_onebot_msg(event, reply_msg_id)
+        if ret:
+            target_text = self._extract_plaintext_from_onebot_message(ret.get("message"))
+            sender = ret.get("sender") or {}
+            target_qq = str(sender.get("user_id") or sender.get("qq") or "") or None
+            card = (sender.get("card") or "").strip()
+            nickname = (sender.get("nickname") or "").strip()
+            target_name = card or nickname or target_qq
 
         # 回退处理
         if not target_text:
@@ -415,6 +406,33 @@ class QuotesPlugin(Star):
         )
         yield event.plain_result(help_text)
 
+    def _get_reply_message_id(self, event: AstrMessageEvent) -> Optional[str]:
+        try:
+            for seg in event.get_messages():  # type: ignore[attr-defined]
+                if isinstance(seg, Comp.Reply):
+                    mid = (
+                        getattr(seg, "message_id", None)
+                        or getattr(seg, "id", None)
+                        or getattr(seg, "reply", None)
+                        or getattr(seg, "msgId", None)
+                    )
+                    if mid:
+                        return str(mid)
+        except Exception as e:
+            logger.warning(f"解析 Reply 段失败: {e}")
+        return None
+
+    async def _fetch_onebot_msg(self, event: AstrMessageEvent, message_id: str) -> Dict[str, Any]:
+        if event.get_platform_name() != "aiocqhttp":
+            return {}
+        try:
+            client = event.bot
+            ret = await client.api.call_action("get_msg", message_id=int(str(message_id)))
+            return ret or {}
+        except Exception as e:
+            logger.info(f"get_msg 失败: {e}")
+            return {}
+
     # ============= 内部方法 =============
     def _extract_at_qq(self, event: AstrMessageEvent) -> Optional[str]:
         try:
@@ -551,6 +569,7 @@ class QuotesPlugin(Star):
 
         avatar = self._avatar_url(q.qq)
         safe_text = self._strip_at_tokens(q.text)
+        escaped_text = html.escape(safe_text)
         grad_width = max(200, int(width * 0.26))
         grad_left = int(width * 0.36) - int(grad_width * 0.7)
 
@@ -593,7 +612,7 @@ class QuotesPlugin(Star):
                 <div class="right">
                     <div class="text">
                         <span class="quote-mark">「</span>
-                        <div>{safe_text}</div>
+                        <div>{escaped_text}</div>
                         <span class="quote-mark">」</span>
                     </div>
                 </div>
@@ -614,7 +633,11 @@ class QuotesPlugin(Star):
 
     async def terminate(self):
         """插件卸载/停用时回调。"""
-        pass
+        try:
+            if getattr(self, "http_client", None):
+                await self.http_client.aclose()
+        except Exception:
+            pass
 
     # ============= 语录提交中文别名 =============
     @filter.command("上传")
