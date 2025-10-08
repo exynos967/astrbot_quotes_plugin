@@ -32,7 +32,8 @@ class Quote:
     text: str
     created_by: str
     created_at: float
-    images: List[str] = field(default_factory=list)  # 相对 data 目录的路径，如 "quotes/images/xxx.jpg"
+    images: List[str] = field(default_factory=list)  # 相对插件数据根目录的路径，如 "images/<group>/<xxx>.jpg"
+    group: str = ""  # 群聊隔离标识：群ID，或私聊为 private_<sender_id>
 
 
 class QuoteStore:
@@ -143,15 +144,15 @@ class QuoteStore:
             self._quotes.append(asdict(q))
             self._write({"quotes": self._quotes})
 
-    async def random_one(self) -> Optional[Quote]:
-        arr = self._quotes
+    async def random_one(self, group_key: str) -> Optional[Quote]:
+        arr = [x for x in self._quotes if str(x.get("group") or "") == str(group_key)]
         if not arr:
             return None
         obj = random.choice(arr)
         return Quote(**obj)
 
-    async def random_one_by_qq(self, qq: str) -> Optional[Quote]:
-        arr = [x for x in self._quotes if str(x.get("qq") or "") == str(qq)]
+    async def random_one_by_qq(self, qq: str, group_key: str) -> Optional[Quote]:
+        arr = [x for x in self._quotes if str(x.get("qq") or "") == str(qq) and str(x.get("group") or "") == str(group_key)]
         if not arr:
             return None
         obj = random.choice(arr)
@@ -223,6 +224,8 @@ class QuotesPlugin(Star):
         self.perf_cfg = (self.config.get("performance") or {})
         self._cfg_text_mode = bool(self.perf_cfg.get("text_mode", False))
         self._cfg_render_cache = bool(self.perf_cfg.get("render_cache", True))
+        # 行为设置
+        self._cfg_global_mode = bool(self.config.get("global_mode", False))  # True=跨群共享语录，False=按群隔离
         # 强制显示头像，移除本地头像命中逻辑
         # 发送记录：避免在消息中暴露 qid，通过会话最近记录辅助删除
         self._pending_qid: Dict[str, str] = {}
@@ -323,6 +326,7 @@ class QuotesPlugin(Star):
             created_by=str(event.get_sender_id()),
             created_at=time(),
             images=images,
+            group=group_key,
         )
         await self.store.add(q)
         if images:
@@ -337,14 +341,17 @@ class QuotesPlugin(Star):
         - 若不含图片，则按原逻辑渲染语录图片。
         也可用：/quote random
         """
-        # 若带 @某人，则仅随机该用户的语录
+        # 当前会话的群聊隔离键（全局模式下忽略）
+        group_key = str(event.get_group_id() or f"private_{event.get_sender_id()}")
+        effective_group = None if self._cfg_global_mode else group_key
+        # 若带 @某人，则仅随机该用户（全局模式下跨群；否则仅本群）
         only_qq = self._extract_at_qq(event)
-        q = await (self.store.random_one_by_qq(only_qq) if only_qq else self.store.random_one())
+        q = await (self.store.random_one_by_qq(only_qq, effective_group) if only_qq else self.store.random_one(effective_group))
         if not q:
             if only_qq:
-                yield event.plain_result("这个用户还没有语录哦~")
+                yield event.plain_result("这个用户还没有语录哦~" if self._cfg_global_mode else "这个用户在本会话还没有语录哦~")
             else:
-                yield event.plain_result("还没有语录，先用 上传 保存一条吧~")
+                yield event.plain_result("还没有语录，先用 上传 保存一条吧~" if self._cfg_global_mode else "本会话还没有语录，先用 上传 保存一条吧~")
             return
         # 在不暴露 qid 的前提下，记录待发送的 qid（会在 after_message_sent 钩子中落到 _last_sent_qid）
         self._pending_qid[self._session_key(event)] = q.id
@@ -486,7 +493,8 @@ class QuotesPlugin(Star):
             "语录插件帮助\n"
             "- 上传：先回复某人的消息，再发送“上传”（可附带图片）保存为语录。可在消息中 @某人 指定图片语录归属；不@则默认归属上传者。\n"
             "- 语录：随机发送一条语录；可用“语录 @某人”仅随机该用户的语录；若含用户上传图片，将直接发送原图。\n"
-            "- 删除：回复机器人刚发送的随机语录消息，发送“删除”或“删除语录”进行删除。"
+            "- 删除：回复机器人刚发送的随机语录消息，发送“删除”或“删除语录”进行删除。\n"
+            "- 设置：可在插件设置开启“全局模式”以跨群共享语录；关闭则各群/私聊互相隔离。"
         )
         yield event.plain_result(help_text)
 

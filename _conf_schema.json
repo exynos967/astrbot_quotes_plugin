@@ -4,6 +4,11 @@
     "type": "string",
     "default": ""
   },
+  "global_mode": {
+    "description": "全局模式：开启后随机语录在所有群/私聊范围内共享（关闭则按会话隔离）",
+    "type": "bool",
+    "default": false
+  },
   "avatar_provider": {
     "description": "头像提供源：qlogo 或 platform（platform 需 Napcat 权限）",
     "type": "string",
