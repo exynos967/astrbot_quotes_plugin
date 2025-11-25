@@ -28,4 +28,4 @@ Napcat/OneBot 平台默认使用 qlogo 头像；也可在配置中改为 platfor
 - `httpx`（下载远程图片）
 
 版本
-- v0.3.0
+- v1.0.0
