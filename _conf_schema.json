@@ -9,6 +9,19 @@
     "type": "bool",
     "default": false
   },
+  "delete_permission": {
+    "description": "删除语录指令的权限组（群员/管理员/群主/Bot 管理员）",
+    "type": "string",
+    "options": ["群员", "管理员", "群主", "Bot管理员"],
+    "default": "管理员",
+    "hint": "群员：所有人可删；管理员：群管理员和群主；群主：仅群主；Bot管理员：仅 AstrBot 配置中的 bot 管理员（admins_id 列表）"
+  },
+  "blacklist": {
+    "description": "语录黑名单 QQ 号列表（list，每项为一个 QQ 号，仅数字）",
+    "type": "list",
+    "default": [],
+    "hint": "示例：[\"123456789\", \"987654321\"]，每个元素为要屏蔽语录的 QQ 号"
+  },
   "avatar_provider": {
     "description": "头像提供源：qlogo 或 platform（platform 需 Napcat 权限）",
     "type": "string",

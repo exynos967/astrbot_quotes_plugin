@@ -279,6 +279,11 @@ class QuotesPlugin(Star):
         else:
             target_qq = str(target_qq or "")
 
+        # 黑名单拦截：被标记为黑名单的 QQ 不再收录语录（包括“上传 QQ号/@” 场景）
+        if target_qq and self._is_blacklisted(target_qq):
+            yield event.plain_result("该用户在语录黑名单中，本次语录已忽略。")
+            return
+
         # 最终以归属 QQ 为准统一解析展示名，避免“名不对号”
         target_name = await self._resolve_user_name(event, target_qq) if target_qq else ""
         if not target_name:
@@ -382,6 +387,11 @@ class QuotesPlugin(Star):
     @filter.command("删除", alias={"删除语录"})
     async def delete_quote(self, event: AstrMessageEvent):
         """删除语录：请『回复机器人发送的语录』并发送“删除”来删除该语录。"""
+        # 权限检查：根据配置的 delete_permission 进行动态校验
+        if not await self._check_delete_permission(event):
+            yield event.plain_result("权限不足：你无权使用删除语录指令。")
+            return
+
         # 提取被回复消息 id
         reply_msg_id: Optional[str] = None
         try:
@@ -403,7 +413,9 @@ class QuotesPlugin(Star):
             return
 
         # 兼容逻辑回退：删除当前会话最近一次随机发送的语录
-        qid: Optional[str] = self._last_sent_qid.get(self._session_key(event))
+        key = self._session_key(event)
+        # 优先使用已确认发送成功的 qid；若因 after_message_sent 钩子异常未写入，则回退使用 pending 记录
+        qid: Optional[str] = self._last_sent_qid.get(key) or self._pending_qid.get(key)
         if not qid:
             yield event.plain_result("未能定位语录，请先重新发送一次随机语录再尝试删除。")
             return
@@ -464,6 +476,75 @@ class QuotesPlugin(Star):
             return {}
 
     # ============= 内部方法 =============
+    async def _check_delete_permission(self, event: AstrMessageEvent) -> bool:
+        """根据配置项 delete_permission 检查当前用户是否有权限删除语录。
+
+        支持的权限组（配置字符串）：
+        - 群员：所有人可用；
+        - 管理员：群管理员、群主 或 AstrBot 配置中的 Bot 管理员；
+        - 群主：仅群主 或 AstrBot Bot 管理员；
+        - Bot管理员：仅 AstrBot 配置中的 Bot 管理员（admins_id 列表）。
+
+        说明：
+        - Bot 管理员由 AstrBot 全局 admins_id 列表决定（event.is_admin()）。
+        - QQ 群管理员/群主通过 event.get_group() 返回的 Group 对象中的
+          group_admins、group_owner 字段判定，仅在群聊场景生效。
+        - 在非群聊场景下，管理员/群主 权限均退化为仅允许 Bot 管理员。
+        """
+        lv_raw = str(self.config.get("delete_permission") or "管理员").strip()
+        level = lv_raw.replace(" ", "")
+
+        # 群员：所有人均可删除
+        if level in {"群员", "member", "普通成员"}:
+            return True
+
+        # AstrBot 定义的 Bot 管理员（admins_id 列表）
+        is_bot_admin = False
+        try:
+            is_bot_admin = bool(getattr(event, "is_admin", None) and event.is_admin())
+        except Exception:
+            is_bot_admin = False
+
+        # 仅 Bot 管理员
+        if level in {"Bot管理员", "bot管理员", "BOT管理员", "bot_admin", "BotAdmin"}:
+            return is_bot_admin
+
+        # 以下权限级别需要考虑群角色；若不是群聊，则退化为仅允许 Bot 管理员
+        group_id = event.get_group_id()
+        if not group_id:
+            return is_bot_admin
+
+        # 通过 AstrBot 的 Group 抽象判断群主/管理员
+        is_group_owner = False
+        is_group_admin = False
+        try:
+            # AiocqhttpMessageEvent.get_group() 会返回包含 owner/admin 列表的 Group
+            group = await (event.get_group() if hasattr(event, "get_group") else None)  # type: ignore[call-arg]
+        except Exception as e:
+            logger.info(f"查询群信息失败: {e}")
+            group = None
+
+        if group is not None:
+            sender_id = str(event.get_sender_id())
+            try:
+                owner_id = str(getattr(group, "group_owner", "") or "")
+                admin_ids = [str(x) for x in getattr(group, "group_admins", [])]
+            except Exception:
+                owner_id = ""
+                admin_ids = []
+            is_group_owner = bool(owner_id and sender_id == owner_id)
+            is_group_admin = bool(sender_id in admin_ids)
+
+        # 管理员：群管理员、群主 或 Bot 管理员
+        if level in {"管理员", "admin"}:
+            return is_group_admin or is_group_owner or is_bot_admin
+        # 群主：仅群主 或 Bot 管理员
+        if level in {"群主", "owner"}:
+            return is_group_owner or is_bot_admin
+
+        # 未知配置值时，出于安全考虑仅允许 Bot 管理员
+        return is_bot_admin
+
     def _extract_at_qq(self, event: AstrMessageEvent) -> Optional[str]:
         """从消息链 Comp.At 段提取 QQ（不做正则解析）。"""
         try:
@@ -476,6 +557,42 @@ class QuotesPlugin(Star):
         except Exception as e:
             logger.warning(f"解析 @ 失败: {e}")
         return None
+
+    def _parse_blacklist(self) -> set[str]:
+        """从配置中解析语录黑名单 QQ 列表。
+
+        配置项 blacklist 现为 list 类型（每项为一个 QQ 号字符串），但也兼容旧版文本配置：
+        - 新版：blacklist = ["123456789", "987654321"]
+        - 兼容：若读取到的是字符串，则按旧逻辑按行与中英文分号/逗号切分。
+        仅保留纯数字且长度>=5 的条目，作为有效 QQ 号。
+        """
+        raw_val = self.config.get("blacklist")  # 可能是 list 或 str
+        items: set[str] = set()
+
+        # 新版 list 配置
+        if isinstance(raw_val, (list, tuple)):
+            for v in raw_val:
+                s = str(v).strip()
+                if s.isdigit() and len(s) >= 5:
+                    items.add(s)
+            return items
+
+        # 兼容旧版文本配置
+        raw = str(raw_val or "").strip()
+        if not raw:
+            return set()
+        for line in raw.splitlines():
+            for token in re.split(r"[;,，；]", line):
+                s = token.strip()
+                if s.isdigit() and len(s) >= 5:
+                    items.add(s)
+        return items
+
+    def _is_blacklisted(self, qq: Optional[str]) -> bool:
+        """判断给定 QQ 是否在语录黑名单中。"""
+        if not qq:
+            return False
+        return str(qq) in self._parse_blacklist()
 
     async def _resolve_user_name(self, event: AstrMessageEvent, qq: str) -> str:
         # 优先尝试平台 API（Napcat），否则退回 qq 号
@@ -688,5 +805,3 @@ class QuotesPlugin(Star):
         text = text.replace("@全体成员", "")
         # 压缩多余空白
         return " ".join(text.split())
-
-
