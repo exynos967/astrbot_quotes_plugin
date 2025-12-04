@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import re
 import html
+import secrets
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -101,7 +101,9 @@ class QuoteStore:
             if "." in name_guess and len(Path(name_guess).suffix) <= 5:
                 ext = Path(name_guess).suffix
             from time import time
-            filename = f"{int(time()*1000)}_{random.randint(1000,9999)}{ext}"
+            # 使用加时间戳的不可预测随机后缀，提升随机性
+            suffix = secrets.token_hex(2)
+            filename = f"{int(time()*1000)}_{suffix}{ext}"
             abs_path = self.images_abs(filename, group_key)
             abs_path.write_bytes(content)
             return self.images_rel(filename, group_key)
@@ -117,7 +119,8 @@ class QuoteStore:
                 return None
             ext = sp.suffix or ".jpg"
             from time import time
-            filename = f"{int(time()*1000)}_{random.randint(1000,9999)}{ext}"
+            suffix = secrets.token_hex(2)
+            filename = f"{int(time()*1000)}_{suffix}{ext}"
             dp = self.images_abs(filename, group_key)
             data = sp.read_bytes()
             dp.write_bytes(data)
@@ -155,7 +158,7 @@ class QuoteStore:
             arr = [x for x in self._quotes if str(x.get("group") or "") == str(group_key)]
         if not arr:
             return None
-        obj = random.choice(arr)
+        obj = secrets.choice(arr)
         return Quote(**obj)
 
     async def random_one_by_qq(self, qq: str, group_key: Optional[str] = None) -> Optional[Quote]:
@@ -175,7 +178,7 @@ class QuoteStore:
             ]
         if not arr:
             return None
-        obj = random.choice(arr)
+        obj = secrets.choice(arr)
         return Quote(**obj)
 
     async def delete_by_id(self, qid: str) -> bool:
@@ -218,6 +221,15 @@ class QuotesPlugin(Star):
         self._cfg_render_cache = bool(self.perf_cfg.get("render_cache", True))
         # 行为设置
         self._cfg_global_mode = bool(self.config.get("global_mode", False))  # True=跨群共享语录，False=按群隔离
+        # 戳一戳触发配置
+        self._cfg_poke_enabled = bool(self.config.get("poke_enabled", True))
+        raw_prob = self.config.get("poke_probability", 100)
+        try:
+            prob = int(raw_prob)
+        except (TypeError, ValueError):
+            prob = 100
+        # 限制在 0-100 范围内，表示百分比概率
+        self._cfg_poke_probability = max(0, min(100, prob))
         # 强制显示头像，移除本地头像命中逻辑
         # 发送记录：避免在消息中暴露 qid，通过会话最近记录辅助删除
         self._pending_qid: Dict[str, str] = {}
@@ -312,8 +324,9 @@ class QuotesPlugin(Star):
 
         from time import time
 
+        # 使用时间戳 + 随机 token 生成不可预测的语录 ID
         q = Quote(
-            id=str(int(time()*1000)) + f"_{random.randint(1000,9999)}",
+            id=str(int(time()*1000)) + f"_{secrets.token_hex(2)}",
             qq=str(target_qq or ""),
             name=str(target_name),
             text=str(target_text),
@@ -333,7 +346,7 @@ class QuotesPlugin(Star):
         """随机发送一条语录：
         - 若该语录含用户上传图片，直接发送原图（不经渲染）。
         - 若不含图片，则按原逻辑渲染语录图片。
-        
+
         支持过滤：指令前缀+语录 <QQ号> 或 指令前缀+语录 @某人。
         """
         # 当前会话的群聊隔离键（全局模式下忽略）
@@ -354,7 +367,7 @@ class QuotesPlugin(Star):
         # 优先发送原图
         if getattr(q, "images", None):
             try:
-                rel = random.choice(q.images)
+                rel = secrets.choice(q.images)
                 # 兼容相对/绝对路径；兼容旧数据（以 quotes/images 开头）
                 p = Path(rel)
                 abs_path = p if p.is_absolute() else (self.store.root / rel)
@@ -398,6 +411,50 @@ class QuotesPlugin(Star):
             logger.info(f"渲染缓存落盘失败: {e}")
         # 仍然直接发 URL
         yield event.image_result(img_url)
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def random_quote_on_poke(self, event: AstrMessageEvent):
+        """当收到包含 Poke（戳一戳）消息段的事件时，复用随机语录逻辑进行回复。
+
+        说明：
+        - 通过检测消息链中的 Comp.Poke 段来识别戳一戳行为；
+        - 为避免破坏现有行为，仅在存在 Poke 段时触发，并复用 random_quote 的实现；
+        - 不解析具体目标用户，以保持与底层 OneBot/Napcat 语义的解耦。
+        """
+        # 总开关：关闭时完全不处理戳一戳事件
+        if not getattr(self, "_cfg_poke_enabled", True):
+            return
+
+        try:
+            segments = list(event.get_messages())  # type: ignore[attr-defined]
+        except Exception:
+            return
+
+        has_poke = False
+        for seg in segments:
+            try:
+                if isinstance(seg, Comp.Poke):
+                    has_poke = True
+                    break
+            except Exception:
+                # 保守处理：某些平台可能不存在 Poke 类型，忽略类型判断异常
+                continue
+
+        if not has_poke:
+            return
+
+        # 触发概率控制（百分比 0-100）
+        prob = getattr(self, "_cfg_poke_probability", 100)
+        if prob <= 0:
+            return
+        if prob < 100:
+            # 使用加密随机源控制概率
+            if secrets.randbelow(100) >= prob:
+                return
+
+        # 复用现有指令逻辑，保持语录选择与渲染策略一致
+        async for res in self.random_quote(event, uid=""):
+            yield res
 
     # 删除了未使用的旧入口与旧版 qid 标记解析，精简结构
 

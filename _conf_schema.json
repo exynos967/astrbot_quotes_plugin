@@ -38,5 +38,16 @@
       "text_color": { "type": "string", "default": "#fff", "description": "文字颜色" },
       "font_family": { "type": "string", "default": "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'WenQuanYi Micro Hei', Arial, sans-serif" }
     }
+  },
+  "poke_enabled": {
+    "description": "是否启用“戳一戳触发随机语录”功能",
+    "type": "bool",
+    "default": true
+  },
+  "poke_probability": {
+    "description": "戳一戳触发随机语录的概率（百分比 0-100，100 表示必触发）",
+    "type": "int",
+    "default": 100,
+    "hint": "0 表示完全不触发；1-100 表示对应的百分比概率。建议取值区间 10-100。"
   }
 }
