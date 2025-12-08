@@ -355,7 +355,7 @@ class QuotesPlugin(Star):
             yield event.plain_result(f"已收录 {q.name} 的语录：{target_text}")
 
     @filter.command("语录")
-    async def random_quote(self, event: AstrMessageEvent, uid: str = ""):
+    async def random_quote(self, event: AstrMessageEvent, uid: str = "", _silent_if_empty: bool = False):
         """随机发送一条语录：
         - 若该语录含用户上传图片，直接发送原图（不经渲染）。
         - 若不含图片，则按原逻辑渲染语录图片。
@@ -370,6 +370,9 @@ class QuotesPlugin(Star):
         only_qq = explicit or self._extract_at_qq(event)
         q = await (self.store.random_one_by_qq(only_qq, effective_group) if only_qq else self.store.random_one(effective_group))
         if not q:
+            # 戳一戳触发时允许在没有语录的情况下静默返回，不打扰群聊
+            if _silent_if_empty:
+                return
             if only_qq:
                 yield event.plain_result("这个用户还没有语录哦~" if self._cfg_global_mode else "这个用户在本会话还没有语录哦~")
             else:
@@ -472,8 +475,8 @@ class QuotesPlugin(Star):
             if secrets.randbelow(100) >= prob:
                 return
 
-        # 复用现有随机语录逻辑
-        async for res in self.random_quote(event, uid=""):
+        # 复用现有随机语录逻辑；当没有语录时静默返回（不发送“本群没有语录”类提示）
+        async for res in self.random_quote(event, uid="", _silent_if_empty=True):
             yield res
 
     # 删除了未使用的旧入口与旧版 qid 标记解析，精简结构
