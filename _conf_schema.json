@@ -1,70 +1,110 @@
 {
   "storage": {
-    "description": "数据存储根目录（留空则自动使用 AstrBot 的 data 目录）",
+    "description": "数据存储根目录",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "留空则自动使用 AstrBot 的 data/plugin_data/quotes/ 目录",
+    "obvious_hint": true
   },
   "global_mode": {
-    "description": "全局模式：开启后随机语录在所有群/私聊范围内共享（关闭则按会话隔离）",
+    "description": "全局模式",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "开启后随机语录在所有群/私聊间共享；关闭则仅限当前会话"
   },
   "delete_permission": {
-    "description": "删除语录指令的权限组（群员/管理员/群主/Bot 管理员）",
+    "description": "删除权限级别",
     "type": "string",
-    "options": ["群员", "管理员", "群主", "Bot管理员"],
+    "options": [
+      "群员",
+      "管理员",
+      "群主",
+      "Bot管理员"
+    ],
     "default": "管理员",
-    "hint": "群员：所有人可删；管理员：群管理员和群主；群主：仅群主；Bot管理员：仅 AstrBot 配置中的 bot 管理员（admins_id 列表）"
+    "hint": "群员：所有人可删 | 管理员：群管+群主 | 群主：仅群主 | Bot管理员：仅机器人管理员"
   },
   "blacklist": {
-    "description": "语录黑名单 QQ 号列表（list，每项为一个 QQ 号，仅数字）",
+    "description": "语录黑名单（QQ号列表）",
     "type": "list",
     "default": [],
-    "hint": "示例：[\"123456789\", \"987654321\"]，每个元素为要屏蔽语录的 QQ 号"
+    "hint": "在此列表中的用户无法被上传语录，仅填写纯数字 QQ 号",
+    "obvious_hint": true
   },
   "avatar_provider": {
-    "description": "头像提供源：qlogo 或 platform（platform 需 Napcat 权限）",
+    "description": "头像来源",
     "type": "string",
-    "options": ["qlogo", "platform"],
-    "default": "qlogo"
+    "options": [
+      "qlogo",
+      "platform"
+    ],
+    "default": "qlogo",
+    "hint": "qlogo：QQ 头像接口 | platform：平台接口（需 Napcat 权限）"
   },
   "image": {
-    "description": "语录图样式配置",
+    "description": "语录卡片样式",
     "type": "object",
     "items": {
-      "width": { "type": "int", "default": 1280, "description": "图片宽度(px)" },
-      "height": { "type": "int", "default": 427, "description": "图片高度(px)" },
-      "bg_color": { "type": "string", "default": "#000", "description": "右侧背景色" },
-      "text_color": { "type": "string", "default": "#fff", "description": "文字颜色" },
-      "font_family": { "type": "string", "default": "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'WenQuanYi Micro Hei', Arial, sans-serif" }
+      "width": {
+        "type": "int",
+        "default": 1280,
+        "description": "图片宽度",
+        "hint": "单位：像素(px)"
+      },
+      "height": {
+        "type": "int",
+        "default": 427,
+        "description": "图片高度",
+        "hint": "单位：像素(px)"
+      },
+      "bg_color": {
+        "type": "string",
+        "default": "#000",
+        "description": "背景颜色",
+        "hint": "右侧文字区域背景色，支持十六进制颜色值"
+      },
+      "text_color": {
+        "type": "string",
+        "default": "#fff",
+        "description": "文字颜色",
+        "hint": "语录文字颜色，支持十六进制颜色值"
+      },
+      "font_family": {
+        "type": "string",
+        "default": "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'WenQuanYi Micro Hei', Arial, sans-serif",
+        "description": "字体",
+        "hint": "CSS 字体栈格式，支持多个字体回退"
+      }
     }
   },
   "image_signature_use_group": {
-    "description": "语录图片右下角签名使用语录所属成员的群名片（群名片/昵称）而不是 QQ 名称",
+    "description": "使用群名片作为语录签名",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "开启后语录图片右下角显示群名片，否则显示 QQ 昵称"
   },
   "poke_enabled": {
-    "description": "是否启用“戳一戳触发随机语录”功能",
+    "description": "启用戳一戳触发",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "开启后对 Bot 戳一戳可随机发送语录"
   },
   "poke_probability": {
-    "description": "戳一戳触发随机语录的概率（百分比 0-100，100 表示必触发）",
+    "description": "戳一戳触发概率",
     "type": "int",
     "default": 20,
-    "hint": "0 表示完全不触发；1-100 表示对应的百分比概率。建议取值区间 10-100。"
+    "hint": "0-100 的整数，100 表示必触发"
   },
   "poke_group_whitelist": {
-    "description": "戳一戳触发的群白名单（群号列表，仅这些群内戳 Bot 时才会触发；留空则不启用白名单）",
+    "description": "群白名单",
     "type": "list",
     "default": [],
-    "hint": "示例：[\"123456789\", \"987654321\"]，每个元素为一个群号字符串。"
+    "hint": "仅这些群的戳一戳会触发；留空则不限制（白名单优先）"
   },
   "poke_group_blacklist": {
-    "description": "戳一戳触发的群黑名单（群号列表，这些群内戳 Bot 将不会触发；若同时配置白名单，则白名单优先）",
+    "description": "群黑名单",
     "type": "list",
     "default": [],
-    "hint": "示例：[\"123456789\", \"987654321\"]，每个元素为一个群号字符串。"
+    "hint": "这些群的戳一戳不会触发；若同时配置白名单，则白名单优先"
   }
 }
