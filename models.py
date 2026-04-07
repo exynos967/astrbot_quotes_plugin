@@ -23,6 +23,85 @@ class QuoteSegment:
 
 
 @dataclass(slots=True)
+class ForwardSegment:
+    type: str
+    text: str = ""
+    asset_id: str = ""
+    qq: str = ""
+    name: str = ""
+    face_id: int = 0
+    nodes: list["ForwardNode"] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ForwardSegment":
+        nodes = [ForwardNode.from_dict(item) for item in (data.get("nodes") or [])]
+        return cls(
+            type=str(data.get("type") or ""),
+            text=str(data.get("text") or ""),
+            asset_id=str(data.get("asset_id") or ""),
+            qq=str(data.get("qq") or ""),
+            name=str(data.get("name") or ""),
+            face_id=int(data.get("face_id") or 0),
+            nodes=nodes,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "text": self.text,
+            "asset_id": self.asset_id,
+            "qq": self.qq,
+            "name": self.name,
+            "face_id": self.face_id,
+            "nodes": [item.to_dict() for item in self.nodes],
+        }
+
+
+@dataclass(slots=True)
+class ForwardNode:
+    sender_uin: str = ""
+    sender_name: str = ""
+    segments: list[ForwardSegment] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ForwardNode":
+        return cls(
+            sender_uin=str(data.get("sender_uin") or ""),
+            sender_name=str(data.get("sender_name") or ""),
+            segments=[ForwardSegment.from_dict(item) for item in (data.get("segments") or [])],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sender_uin": self.sender_uin,
+            "sender_name": self.sender_name,
+            "segments": [item.to_dict() for item in self.segments],
+        }
+
+
+def collect_forward_asset_ids(nodes: list[ForwardNode]) -> tuple[list[str], list[str]]:
+    image_ids: list[str] = []
+    media_ids: list[str] = []
+
+    def walk(current_nodes: list[ForwardNode]) -> None:
+        for node in current_nodes:
+            for segment in node.segments:
+                if not segment.asset_id:
+                    if segment.type == "nodes" and segment.nodes:
+                        walk(segment.nodes)
+                    continue
+                if segment.type == "image":
+                    image_ids.append(segment.asset_id)
+                elif segment.type in {"record", "video", "file"}:
+                    media_ids.append(segment.asset_id)
+                elif segment.type == "nodes" and segment.nodes:
+                    walk(segment.nodes)
+
+    walk(nodes)
+    return image_ids, media_ids
+
+
+@dataclass(slots=True)
 class Quote:
     id: str
     qq: str
@@ -31,11 +110,18 @@ class Quote:
     created_by: str
     created_at: float
     group: str = ""
+    kind: str = "standard"
     image_ids: list[str] = field(default_factory=list)
+    media_ids: list[str] = field(default_factory=list)
     segments: list[QuoteSegment] = field(default_factory=list)
+    forward_nodes: list[ForwardNode] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Quote":
+        kind = str(data.get("kind") or "")
+        forward_nodes_raw = data.get("forward_nodes") or []
+        forward_nodes = [ForwardNode.from_dict(item) for item in forward_nodes_raw]
+
         segments_raw = data.get("segments") or []
         if segments_raw:
             segments = [QuoteSegment.from_dict(item) for item in segments_raw]
@@ -47,9 +133,19 @@ class Quote:
             for image_id in [str(x) for x in (data.get("image_ids") or []) if str(x)]:
                 segments.append(QuoteSegment(type="image", asset_id=image_id))
 
+        if not kind:
+            kind = "forward" if forward_nodes else "standard"
+
         image_ids = [segment.asset_id for segment in segments if segment.type == "image" and segment.asset_id]
+        media_ids = [str(x) for x in (data.get("media_ids") or []) if str(x)]
+        if forward_nodes:
+            forward_image_ids, forward_media_ids = collect_forward_asset_ids(forward_nodes)
+            image_ids = image_ids or forward_image_ids
+            if not media_ids:
+                media_ids = forward_media_ids
         if not image_ids:
             image_ids = [str(x) for x in (data.get("image_ids") or []) if str(x)]
+
         return cls(
             id=str(data.get("id") or ""),
             qq=str(data.get("qq") or ""),
@@ -58,14 +154,22 @@ class Quote:
             created_by=str(data.get("created_by") or ""),
             created_at=float(data.get("created_at") or 0),
             group=str(data.get("group") or ""),
+            kind=kind,
             image_ids=image_ids,
+            media_ids=media_ids,
             segments=segments,
+            forward_nodes=forward_nodes,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        image_ids = [segment.asset_id for segment in self.segments if segment.type == "image" and segment.asset_id]
-        if image_ids:
+        if self.kind == "forward":
+            image_ids, media_ids = collect_forward_asset_ids(self.forward_nodes)
             self.image_ids = image_ids
+            self.media_ids = media_ids
+        else:
+            image_ids = [segment.asset_id for segment in self.segments if segment.type == "image" and segment.asset_id]
+            if image_ids:
+                self.image_ids = image_ids
         return {
             "id": self.id,
             "qq": self.qq,
@@ -74,8 +178,11 @@ class Quote:
             "created_by": self.created_by,
             "created_at": self.created_at,
             "group": self.group,
+            "kind": self.kind,
             "image_ids": self.image_ids,
+            "media_ids": self.media_ids,
             "segments": [segment.to_dict() for segment in self.segments],
+            "forward_nodes": [node.to_dict() for node in self.forward_nodes],
         }
 
 
@@ -110,6 +217,32 @@ class ImageAsset:
 
 
 @dataclass(slots=True)
+class MediaAsset:
+    asset_id: str
+    media_type: str
+    file_name: str
+    rel_path: str
+    display_name: str = ""
+    ref_count: int = 0
+    created_at: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MediaAsset":
+        return cls(
+            asset_id=str(data.get("asset_id") or ""),
+            media_type=str(data.get("media_type") or ""),
+            file_name=str(data.get("file_name") or ""),
+            rel_path=str(data.get("rel_path") or ""),
+            display_name=str(data.get("display_name") or ""),
+            ref_count=int(data.get("ref_count") or 0),
+            created_at=float(data.get("created_at") or 0),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class PreparedImage:
     content: bytes
     extension: str
@@ -124,6 +257,15 @@ class PreparedImage:
         if self.width <= 0 or self.height <= 0:
             return 0.0
         return self.width / self.height
+
+
+@dataclass(slots=True)
+class PreparedMedia:
+    content: bytes
+    extension: str
+    media_type: str
+    source: str = ""
+    display_name: str = ""
 
 
 @dataclass(slots=True)
@@ -151,3 +293,22 @@ class PendingQuoteSegment:
     type: str
     text: str = ""
     image: PreparedImage | None = None
+
+
+@dataclass(slots=True)
+class PendingForwardSegment:
+    type: str
+    text: str = ""
+    image: PreparedImage | None = None
+    media: PreparedMedia | None = None
+    qq: str = ""
+    name: str = ""
+    face_id: int = 0
+    nodes: list["PendingForwardNode"] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PendingForwardNode:
+    sender_uin: str = ""
+    sender_name: str = ""
+    segments: list[PendingForwardSegment] = field(default_factory=list)

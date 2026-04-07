@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 PLUGIN_NAME = "quotes"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DUPLICATE_IMAGE_MESSAGE = "语录图片已存在"
 GROUPS_DIRNAME = "groups"
 IMAGES_DIRNAME = "images"
+MEDIA_DIRNAME = "media"
 CACHE_DIRNAME = "cache"
 IMAGE_INDEX_FILENAME = "image_index.json"
+MEDIA_INDEX_FILENAME = "media_index.json"
 QUOTES_FILENAME = "quotes.json"
 LEGACY_QUOTES_BAK_SUFFIX = ".bak"
 DEFAULT_DHASH_THRESHOLD = 4

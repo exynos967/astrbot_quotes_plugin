@@ -27,18 +27,20 @@ try:
         DEFAULT_DHASH_SIZE,
         DEFAULT_DHASH_THRESHOLD,
         GROUPS_DIRNAME,
+        MEDIA_DIRNAME,
         PLUGIN_NAME,
     )
-    from .models import PreparedImage
+    from .models import PreparedImage, PreparedMedia
 except ImportError:  # pragma: no cover
     from constants import (
         DEFAULT_ASPECT_RATIO_TOLERANCE,
         DEFAULT_DHASH_SIZE,
         DEFAULT_DHASH_THRESHOLD,
         GROUPS_DIRNAME,
+        MEDIA_DIRNAME,
         PLUGIN_NAME,
     )
-    from models import PreparedImage
+    from models import PreparedImage, PreparedMedia
 
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -155,6 +157,41 @@ def guess_extension(source_name: str = "", content_type: str = "") -> str:
     return ".jpg"
 
 
+def guess_media_extension(source_name: str = "", content_type: str = "", media_type: str = "") -> str:
+    if source_name:
+        suffix = Path(source_name).suffix.lower()
+        if 0 < len(suffix) <= 10:
+            return suffix
+
+    lowered_type = (content_type or "").lower()
+    mappings = {
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/amr": ".amr",
+        "audio/aac": ".aac",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/x-msvideo": ".avi",
+        "application/pdf": ".pdf",
+        "application/zip": ".zip",
+        "application/json": ".json",
+        "text/plain": ".txt",
+    }
+    for key, extension in mappings.items():
+        if key in lowered_type:
+            return extension
+
+    default_map = {
+        "record": ".wav",
+        "video": ".mp4",
+        "file": ".bin",
+    }
+    return default_map.get(str(media_type or "").lower(), ".bin")
+
+
 def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[str, int, int]:
     try:
         from io import BytesIO
@@ -191,6 +228,28 @@ def prepare_image(content: bytes, *, source: str = "", content_type: str = "") -
         dhash=dhash,
         width=width,
         height=height,
+    )
+
+
+def prepare_media(
+    content: bytes,
+    *,
+    media_type: str,
+    source: str = "",
+    content_type: str = "",
+    display_name: str = "",
+) -> PreparedMedia:
+    extension = guess_media_extension(
+        source_name=display_name or source,
+        content_type=content_type,
+        media_type=media_type,
+    )
+    return PreparedMedia(
+        content=content,
+        extension=extension,
+        media_type=media_type,
+        source=source,
+        display_name=display_name or Path(source).name or f"{media_type}{extension}",
     )
 
 
@@ -236,3 +295,7 @@ def random_id(prefix: str = "") -> str:
 
 def rel_image_path(session_key: str, file_name: str) -> str:
     return f"{GROUPS_DIRNAME}/{session_key}/images/{file_name}"
+
+
+def rel_media_path(session_key: str, file_name: str) -> str:
+    return f"{GROUPS_DIRNAME}/{session_key}/{MEDIA_DIRNAME}/{file_name}"

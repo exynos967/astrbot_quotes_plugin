@@ -13,19 +13,19 @@ except Exception:  # pragma: no cover
     Comp = None  # type: ignore
 
 try:
-    from .models import CommandResponse, Quote
+    from .constants import DUPLICATE_IMAGE_MESSAGE
+    from .models import CommandResponse, ForwardNode, ForwardSegment, Quote
     from .napcat_service import NapcatService
     from .renderer import QuoteRenderer
     from .store import QuoteRepository
     from .utils import is_valid_qq, make_session_key, normalize_quote_text, random_id
-    from .constants import DUPLICATE_IMAGE_MESSAGE
 except ImportError:  # pragma: no cover
-    from models import CommandResponse, Quote
+    from constants import DUPLICATE_IMAGE_MESSAGE
+    from models import CommandResponse, ForwardNode, ForwardSegment, Quote
     from napcat_service import NapcatService
     from renderer import QuoteRenderer
     from store import QuoteRepository
     from utils import is_valid_qq, make_session_key, normalize_quote_text, random_id
-    from constants import DUPLICATE_IMAGE_MESSAGE
 
 
 class QuoteService:
@@ -61,6 +61,19 @@ class QuoteService:
         reply_sender = reply_payload.get("sender") or {}
         reply_qq = str(reply_sender.get("user_id") or reply_sender.get("qq") or "")
         explicit_qq = uid.strip() if is_valid_qq(uid) else ""
+        mention_qq = self.extract_at_qq(event) or ""
+
+        forward_id, forward_payload = self.napcat_service.extract_forward_reference(reply_payload.get("message"))
+        if forward_id or forward_payload:
+            return await self._add_forward_quote(
+                event,
+                session_key=session_key,
+                reply_qq=reply_qq,
+                explicit_qq=explicit_qq,
+                mention_qq=mention_qq,
+                forward_id=forward_id,
+                forward_payload=forward_payload,
+            )
 
         reply_segments = await self.image_service.build_reply_segments(event, reply_payload.get("message"))
         current_segments = await self.image_service.build_current_segments(
@@ -72,7 +85,6 @@ class QuoteService:
         if not all_segments:
             return CommandResponse(kind="plain", text="未获取到被回复消息内容或图片，请确认已正确回复对方的消息或附带图片。")
 
-        mention_qq = self.extract_at_qq(event) or ""
         if explicit_qq:
             target_qq = explicit_qq
         elif mention_qq:
@@ -111,6 +123,64 @@ class QuoteService:
             return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。")
         return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录：{quote.text}")
 
+    async def _add_forward_quote(
+        self,
+        event: Any,
+        *,
+        session_key: str,
+        reply_qq: str,
+        explicit_qq: str,
+        mention_qq: str,
+        forward_id: str | None,
+        forward_payload: dict[str, Any] | None,
+    ) -> CommandResponse:
+        nodes = await self.image_service.build_forward_nodes(
+            event,
+            forward_id=forward_id,
+            forward_payload=forward_payload,
+            forward_loader=self.napcat_service.fetch_forward_messages,
+        )
+        if not nodes:
+            return CommandResponse(kind="plain", text="未获取到可用的聊天记录内容，请确认回复的是 QQ 合并转发消息。")
+
+        if explicit_qq:
+            target_qq = explicit_qq
+        elif mention_qq:
+            target_qq = mention_qq
+        elif reply_qq:
+            target_qq = reply_qq
+        else:
+            target_qq = str(event.get_sender_id())
+
+        if target_qq and target_qq in self.blacklist:
+            return CommandResponse(kind="plain", text="该用户在语录黑名单中，本次语录已忽略。")
+
+        target_name = await self.napcat_service.resolve_user_name(event, target_qq) if target_qq else ""
+        if not target_name:
+            target_name = target_qq or "未知用户"
+
+        from time import time
+
+        quote = Quote(
+            id=random_id("q_"),
+            qq=str(target_qq or ""),
+            name=str(target_name),
+            text=self._flatten_forward_nodes(nodes),
+            created_by=str(event.get_sender_id()),
+            created_at=time(),
+            group=session_key,
+            kind="forward",
+        )
+        result = await self.repository.create_quote_with_forward_nodes(session_key, quote, nodes)
+        if result.duplicate:
+            return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
+
+        message_count = self._count_forward_messages(nodes)
+        return CommandResponse(
+            kind="plain",
+            text=f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。",
+        )
+
     async def random_quote(self, event: Any, uid: str = "", silent_if_empty: bool = False) -> CommandResponse | None:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
         target_session = None if self.global_mode else session_key
@@ -130,8 +200,8 @@ class QuoteService:
         if chain:
             return CommandResponse(kind="chain", chain=chain, quote_id=quote.id)
 
-        if self.text_mode:
-            return CommandResponse(kind="plain", text=f"「{quote.text}」 — {quote.name}", quote_id=quote.id)
+        if self.text_mode or quote.kind == "forward":
+            return CommandResponse(kind="plain", text=self._quote_plain_fallback(quote), quote_id=quote.id)
 
         store = self.repository.get_store(quote.group)
         cache_path = store.cache_path(quote.id)
@@ -155,6 +225,11 @@ class QuoteService:
     def build_quote_chain(self, quote: Quote) -> list[Any]:
         if Comp is None:
             return []
+        if quote.kind == "forward":
+            return self.build_forward_quote_chain(quote)
+        return self.build_standard_quote_chain(quote)
+
+    def build_standard_quote_chain(self, quote: Quote) -> list[Any]:
         if not quote.segments:
             return []
         has_image = any(segment.type == "image" and segment.asset_id for segment in quote.segments)
@@ -177,6 +252,104 @@ class QuoteService:
             if abs_path.exists():
                 chain.append(Comp.Image.fromFileSystem(str(abs_path)))
         return chain
+
+    def build_forward_quote_chain(self, quote: Quote) -> list[Any]:
+        if not quote.forward_nodes:
+            return []
+        nodes = [self._build_forward_node_component(quote.group, node) for node in quote.forward_nodes]
+        nodes = [node for node in nodes if node is not None]
+        if not nodes:
+            return []
+        return [Comp.Nodes(nodes=nodes)]
+
+    def _build_forward_node_component(self, session_key: str, node: ForwardNode) -> Any | None:
+        content = self._build_forward_segment_components(session_key, node.segments)
+        if not content:
+            content = [Comp.Plain("[空消息]")]
+        try:
+            return Comp.Node(
+                uin=str(node.sender_uin or "0"),
+                name=str(node.sender_name or node.sender_uin or "未知用户"),
+                content=content,
+            )
+        except Exception as exc:
+            logger.info(f"构造 forward 节点失败: {exc}")
+            return None
+
+    def _build_forward_segment_components(self, session_key: str, segments: list[ForwardSegment]) -> list[Any]:
+        content: list[Any] = []
+        for segment in segments:
+            if segment.type == "text":
+                text = str(segment.text or "")
+                if text:
+                    content.append(Comp.Plain(text))
+                continue
+
+            if segment.type == "image" and segment.asset_id:
+                asset = self.repository.find_asset(session_key, segment.asset_id)
+                if asset is not None:
+                    abs_path = self.repository.root / asset.rel_path
+                    if abs_path.exists():
+                        content.append(Comp.Image.fromFileSystem(str(abs_path)))
+                        continue
+                content.append(Comp.Plain("[图片]"))
+                continue
+
+            if segment.type in {"record", "video", "file"} and segment.asset_id:
+                media_asset = self.repository.find_media_asset(session_key, segment.asset_id)
+                if media_asset is None:
+                    content.append(Comp.Plain(self._placeholder_for_media(segment.type)))
+                    continue
+                abs_path = self.repository.root / media_asset.rel_path
+                if not abs_path.exists():
+                    content.append(Comp.Plain(self._placeholder_for_media(segment.type)))
+                    continue
+                component = self._build_media_component(segment.type, abs_path, media_asset.display_name)
+                if component is None:
+                    content.append(Comp.Plain(self._placeholder_for_media(segment.type)))
+                else:
+                    content.append(component)
+                continue
+
+            if segment.type == "face" and segment.face_id:
+                try:
+                    content.append(Comp.Face(id=segment.face_id))
+                except Exception:
+                    content.append(Comp.Plain("[表情]"))
+                continue
+
+            if segment.type == "at" and segment.qq:
+                try:
+                    content.append(Comp.At(qq=segment.qq, name=segment.name or ""))
+                except Exception:
+                    content.append(Comp.Plain(f"@{segment.name or segment.qq}"))
+                continue
+
+            if segment.type == "nodes":
+                nested_nodes = [self._build_forward_node_component(session_key, node) for node in segment.nodes]
+                nested_nodes = [node for node in nested_nodes if node is not None]
+                if nested_nodes:
+                    content.append(Comp.Nodes(nodes=nested_nodes))
+                else:
+                    content.append(Comp.Plain("[聊天记录]"))
+                continue
+
+            placeholder = self._placeholder_for_unknown(segment.type)
+            if placeholder:
+                content.append(Comp.Plain(placeholder))
+        return content
+
+    def _build_media_component(self, media_type: str, path: Path, display_name: str) -> Any | None:
+        try:
+            if media_type == "record":
+                return Comp.Record.fromFileSystem(str(path))
+            if media_type == "video":
+                return Comp.Video.fromFileSystem(str(path))
+            if media_type == "file":
+                return Comp.File(file=str(path), name=display_name or path.name)
+        except Exception as exc:
+            logger.info(f"构造媒体组件失败({media_type}): {exc}")
+        return None
 
     async def cache_rendered_result(self, rendered_url: str, cache_path: Path) -> bool:
         if not self.render_cache:
@@ -227,29 +400,6 @@ class QuoteService:
             logger.warning(f"解析 Reply 段失败: {exc}")
         return None
 
-    def extract_plaintext_from_onebot_message(self, message: Any) -> str:
-        if not isinstance(message, list):
-            return ""
-        parts: list[str] = []
-        for segment in message:
-            if (segment.get("type") or "").lower() in {"text", "plain"}:
-                parts.append(str((segment.get("data") or {}).get("text") or ""))
-        return normalize_quote_text("".join(parts).strip())
-
-    def extract_plaintext_from_segments(self, event: Any, command_name: str = "") -> str:
-        parts: list[str] = []
-        try:
-            for segment in event.get_messages():
-                if Comp is not None and isinstance(segment, Comp.Plain):
-                    parts.append(str(getattr(segment, "text", "") or ""))
-        except Exception:
-            raw_text = str(getattr(event, "message_str", "") or "")
-            parts = [raw_text]
-        text = "".join(parts).strip()
-        if command_name and text.startswith(command_name):
-            text = text[len(command_name) :].strip()
-        return normalize_quote_text(text)
-
     def _normalize_pending_segments(self, segments: list[Any]) -> list[Any]:
         normalized: list[Any] = []
         for segment in segments:
@@ -266,3 +416,56 @@ class QuoteService:
     def _plain_text_from_pending_segments(self, segments: list[Any]) -> str:
         parts = [str(segment.text or "") for segment in segments if segment.type == "text" and str(segment.text or "").strip()]
         return " ".join(parts).strip()
+
+    def _flatten_forward_nodes(self, nodes: list[Any]) -> str:
+        lines: list[str] = []
+        for node in nodes:
+            sender = str(getattr(node, "sender_name", "") or getattr(node, "sender_uin", "") or "未知用户")
+            parts: list[str] = []
+            for segment in getattr(node, "segments", []):
+                if segment.type == "text" and segment.text:
+                    parts.append(str(segment.text))
+                elif segment.type == "image":
+                    parts.append("[图片]")
+                elif segment.type == "record":
+                    parts.append("[语音]")
+                elif segment.type == "video":
+                    parts.append("[视频]")
+                elif segment.type == "file":
+                    parts.append("[文件]")
+                elif segment.type == "face" and getattr(segment, "face_id", 0):
+                    parts.append("[表情]")
+                elif segment.type == "at" and getattr(segment, "qq", ""):
+                    parts.append(f"@{segment.name or segment.qq}")
+                elif segment.type == "nodes":
+                    parts.append("[聊天记录]")
+            content = "".join(parts).strip()
+            if content:
+                lines.append(f"{sender}：{content}")
+        return "\n".join(lines).strip()
+
+    def _count_forward_messages(self, nodes: list[Any]) -> int:
+        total = 0
+        for node in nodes:
+            total += 1
+            for segment in getattr(node, "segments", []):
+                if segment.type == "nodes":
+                    total += self._count_forward_messages(segment.nodes)
+        return total
+
+    def _quote_plain_fallback(self, quote: Quote) -> str:
+        if quote.kind == "forward":
+            return quote.text or f"{quote.name} 的聊天记录语录"
+        return f"「{quote.text}」 — {quote.name}"
+
+    def _placeholder_for_media(self, media_type: str) -> str:
+        return {
+            "record": "[语音]",
+            "video": "[视频]",
+            "file": "[文件]",
+        }.get(media_type, "[附件]")
+
+    def _placeholder_for_unknown(self, seg_type: str) -> str:
+        if not seg_type:
+            return ""
+        return f"[{seg_type}]"

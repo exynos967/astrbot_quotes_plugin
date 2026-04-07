@@ -22,10 +22,23 @@ try:
         IMAGE_INDEX_FILENAME,
         IMAGES_DIRNAME,
         LEGACY_QUOTES_BAK_SUFFIX,
+        MEDIA_DIRNAME,
+        MEDIA_INDEX_FILENAME,
         QUOTES_FILENAME,
         SCHEMA_VERSION,
     )
-    from .models import ImageAsset, PendingQuoteSegment, PreparedImage, Quote, QuoteSegment
+    from .models import (
+        ForwardNode,
+        ForwardSegment,
+        ImageAsset,
+        MediaAsset,
+        PendingForwardNode,
+        PendingQuoteSegment,
+        PreparedImage,
+        PreparedMedia,
+        Quote,
+        QuoteSegment,
+    )
     from .utils import (
         atomic_write_json,
         is_near_duplicate,
@@ -33,6 +46,7 @@ try:
         random_id,
         read_json,
         rel_image_path,
+        rel_media_path,
     )
 except ImportError:  # pragma: no cover
     from constants import (
@@ -42,10 +56,23 @@ except ImportError:  # pragma: no cover
         IMAGE_INDEX_FILENAME,
         IMAGES_DIRNAME,
         LEGACY_QUOTES_BAK_SUFFIX,
+        MEDIA_DIRNAME,
+        MEDIA_INDEX_FILENAME,
         QUOTES_FILENAME,
         SCHEMA_VERSION,
     )
-    from models import ImageAsset, PendingQuoteSegment, PreparedImage, Quote, QuoteSegment
+    from models import (
+        ForwardNode,
+        ForwardSegment,
+        ImageAsset,
+        MediaAsset,
+        PendingForwardNode,
+        PendingQuoteSegment,
+        PreparedImage,
+        PreparedMedia,
+        Quote,
+        QuoteSegment,
+    )
     from utils import (
         atomic_write_json,
         is_near_duplicate,
@@ -53,6 +80,7 @@ except ImportError:  # pragma: no cover
         random_id,
         read_json,
         rel_image_path,
+        rel_media_path,
     )
 
 
@@ -69,12 +97,15 @@ class SessionStore:
         self.session_key = session_key
         self.root = self.plugin_root / GROUPS_DIRNAME / session_key
         self.images_dir = self.root / IMAGES_DIRNAME
+        self.media_dir = self.root / MEDIA_DIRNAME
         self.cache_dir = self.root / CACHE_DIRNAME
         self.quotes_file = self.root / QUOTES_FILENAME
         self.image_index_file = self.root / IMAGE_INDEX_FILENAME
+        self.media_index_file = self.root / MEDIA_INDEX_FILENAME
         self.lock = asyncio.Lock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.media_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def load_quotes(self) -> list[Quote]:
@@ -111,8 +142,28 @@ class SessionStore:
             },
         )
 
+    def load_media_assets(self) -> list[MediaAsset]:
+        payload = read_json(
+            self.media_index_file,
+            {"schema_version": SCHEMA_VERSION, "session_key": self.session_key, "media": []},
+        )
+        return [MediaAsset.from_dict(item) for item in (payload.get("media") or [])]
+
+    def save_media_assets(self, assets: list[MediaAsset]) -> None:
+        atomic_write_json(
+            self.media_index_file,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "session_key": self.session_key,
+                "media": [item.to_dict() for item in assets],
+            },
+        )
+
     def image_abs_path(self, file_name: str) -> Path:
         return self.images_dir / file_name
+
+    def media_abs_path(self, file_name: str) -> Path:
+        return self.media_dir / file_name
 
     def cache_path(self, quote_id: str) -> Path:
         return self.cache_dir / f"{quote_id}.png"
@@ -139,6 +190,12 @@ class QuoteRepository:
 
     def find_asset(self, session_key: str, asset_id: str) -> ImageAsset | None:
         for asset in self.get_store(session_key).load_assets():
+            if asset.asset_id == asset_id:
+                return asset
+        return None
+
+    def find_media_asset(self, session_key: str, asset_id: str) -> MediaAsset | None:
+        for asset in self.get_store(session_key).load_media_assets():
             if asset.asset_id == asset_id:
                 return asset
         return None
@@ -174,36 +231,77 @@ class QuoteRepository:
                     if segment.type != "image" or image is None:
                         continue
 
-                    file_name = f"{random_id()}{image.extension}"
-                    abs_path = store.image_abs_path(file_name)
-                    abs_path.write_bytes(image.content)
-                    created_files.append(abs_path)
-                    asset = ImageAsset(
-                        asset_id=random_id("img_"),
-                        file_name=file_name,
-                        rel_path=rel_image_path(session_key, file_name),
-                        sha256=image.sha256,
-                        dhash=image.dhash,
-                        width=image.width,
-                        height=image.height,
-                        ref_count=1,
+                    asset = self._persist_image_asset(
+                        store,
+                        image,
                         created_at=time(),
+                        created_files=created_files,
                     )
                     created_assets.append(asset)
-                    persisted_segments.append(
-                        QuoteSegment(
-                            type="image",
-                            asset_id=asset.asset_id,
-                        )
-                    )
+                    persisted_segments.append(QuoteSegment(type="image", asset_id=asset.asset_id))
 
+                quote.kind = "standard"
+                quote.forward_nodes = []
                 quote.segments = persisted_segments
                 quote.image_ids = [item.asset_id for item in created_assets]
+                quote.media_ids = []
                 if not quote.text:
-                    quote.text = " ".join(segment.text for segment in persisted_segments if segment.type == "text").strip()
+                    quote.text = " ".join(
+                        segment.text for segment in persisted_segments if segment.type == "text"
+                    ).strip()
                 quotes.append(quote)
                 assets.extend(created_assets)
                 store.save_assets(assets)
+                store.save_quotes(quotes)
+            except Exception:
+                for path in created_files:
+                    path.unlink(missing_ok=True)
+                raise
+
+        return CreateQuoteResult(quote=quote)
+
+    async def create_quote_with_forward_nodes(
+        self,
+        session_key: str,
+        quote: Quote,
+        nodes: list[PendingForwardNode],
+    ) -> CreateQuoteResult:
+        store = self.get_store(session_key)
+        async with store.lock:
+            quotes = store.load_quotes()
+            image_assets = store.load_assets()
+            media_assets = store.load_media_assets()
+            images = self._collect_pending_forward_images(nodes)
+            if self._has_duplicate(images, image_assets):
+                return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
+
+            from time import time
+
+            created_image_assets: list[ImageAsset] = []
+            created_media_assets: list[MediaAsset] = []
+            created_files: list[Path] = []
+            try:
+                persisted_nodes, image_ids, media_ids = self._persist_forward_nodes(
+                    store,
+                    nodes,
+                    created_image_assets=created_image_assets,
+                    created_media_assets=created_media_assets,
+                    created_files=created_files,
+                    created_at=time(),
+                )
+                quote.kind = "forward"
+                quote.segments = []
+                quote.forward_nodes = persisted_nodes
+                quote.image_ids = image_ids
+                quote.media_ids = media_ids
+                if not quote.text:
+                    quote.text = self._flatten_forward_nodes(persisted_nodes)
+
+                quotes.append(quote)
+                image_assets.extend(created_image_assets)
+                media_assets.extend(created_media_assets)
+                store.save_assets(image_assets)
+                store.save_media_assets(media_assets)
                 store.save_quotes(quotes)
             except Exception:
                 for path in created_files:
@@ -240,24 +338,36 @@ class QuoteRepository:
                     continue
 
                 quotes = [item for item in quotes if item.id != quote_id]
-                assets = store.load_assets()
-                asset_map = {item.asset_id: item for item in assets}
+                image_assets = store.load_assets()
+                media_assets = store.load_media_assets()
+                image_map = {item.asset_id: item for item in image_assets}
+                media_map = {item.asset_id: item for item in media_assets}
                 for image_id in target.image_ids:
-                    asset = asset_map.get(image_id)
-                    if asset is None:
-                        continue
-                    asset.ref_count = max(0, asset.ref_count - 1)
+                    asset = image_map.get(image_id)
+                    if asset is not None:
+                        asset.ref_count = max(0, asset.ref_count - 1)
+                for media_id in target.media_ids:
+                    asset = media_map.get(media_id)
+                    if asset is not None:
+                        asset.ref_count = max(0, asset.ref_count - 1)
 
-                kept_assets: list[ImageAsset] = []
-                for asset in assets:
+                kept_image_assets: list[ImageAsset] = []
+                for asset in image_assets:
                     if asset.ref_count > 0:
-                        kept_assets.append(asset)
+                        kept_image_assets.append(asset)
                         continue
-                    abs_path = self.root / asset.rel_path
-                    abs_path.unlink(missing_ok=True)
+                    (self.root / asset.rel_path).unlink(missing_ok=True)
+
+                kept_media_assets: list[MediaAsset] = []
+                for asset in media_assets:
+                    if asset.ref_count > 0:
+                        kept_media_assets.append(asset)
+                        continue
+                    (self.root / asset.rel_path).unlink(missing_ok=True)
 
                 store.cache_path(quote_id).unlink(missing_ok=True)
-                store.save_assets(kept_assets)
+                store.save_assets(kept_image_assets)
+                store.save_media_assets(kept_media_assets)
                 store.save_quotes(quotes)
                 return True
         return False
@@ -357,6 +467,189 @@ class QuoteRepository:
             logger.info(f"已完成旧语录数据迁移，备份文件: {backup_path}")
             return True
 
+    def _collect_pending_forward_images(self, nodes: list[PendingForwardNode]) -> list[PreparedImage]:
+        images: list[PreparedImage] = []
+        for node in nodes:
+            for segment in node.segments:
+                if segment.type == "image" and segment.image is not None:
+                    images.append(segment.image)
+                elif segment.type == "nodes" and segment.nodes:
+                    images.extend(self._collect_pending_forward_images(segment.nodes))
+        return images
+
+    def _persist_forward_nodes(
+        self,
+        store: SessionStore,
+        nodes: list[PendingForwardNode],
+        *,
+        created_image_assets: list[ImageAsset],
+        created_media_assets: list[MediaAsset],
+        created_files: list[Path],
+        created_at: float,
+    ) -> tuple[list[ForwardNode], list[str], list[str]]:
+        persisted_nodes: list[ForwardNode] = []
+        image_ids: list[str] = []
+        media_ids: list[str] = []
+
+        for node in nodes:
+            persisted_segments: list[ForwardSegment] = []
+            for segment in node.segments:
+                if segment.type == "text":
+                    text = str(segment.text or "").strip()
+                    if text:
+                        persisted_segments.append(ForwardSegment(type="text", text=text))
+                    continue
+
+                if segment.type == "image":
+                    if segment.image is None:
+                        persisted_segments.append(ForwardSegment(type="text", text="[图片]"))
+                        continue
+                    asset = self._persist_image_asset(
+                        store,
+                        segment.image,
+                        created_at=created_at,
+                        created_files=created_files,
+                    )
+                    created_image_assets.append(asset)
+                    image_ids.append(asset.asset_id)
+                    persisted_segments.append(ForwardSegment(type="image", asset_id=asset.asset_id))
+                    continue
+
+                if segment.type in {"record", "video", "file"}:
+                    if segment.media is None:
+                        persisted_segments.append(
+                            ForwardSegment(type="text", text=self._placeholder_for_media(segment.type))
+                        )
+                        continue
+                    asset = self._persist_media_asset(
+                        store,
+                        segment.media,
+                        created_at=created_at,
+                        created_files=created_files,
+                    )
+                    created_media_assets.append(asset)
+                    media_ids.append(asset.asset_id)
+                    persisted_segments.append(ForwardSegment(type=segment.type, asset_id=asset.asset_id))
+                    continue
+
+                if segment.type == "face":
+                    if segment.face_id:
+                        persisted_segments.append(ForwardSegment(type="face", face_id=segment.face_id))
+                    continue
+
+                if segment.type == "at":
+                    if segment.qq:
+                        persisted_segments.append(
+                            ForwardSegment(type="at", qq=segment.qq, name=segment.name)
+                        )
+                    continue
+
+                if segment.type == "nodes":
+                    nested_nodes, nested_image_ids, nested_media_ids = self._persist_forward_nodes(
+                        store,
+                        segment.nodes,
+                        created_image_assets=created_image_assets,
+                        created_media_assets=created_media_assets,
+                        created_files=created_files,
+                        created_at=created_at,
+                    )
+                    if nested_nodes:
+                        image_ids.extend(nested_image_ids)
+                        media_ids.extend(nested_media_ids)
+                        persisted_segments.append(ForwardSegment(type="nodes", nodes=nested_nodes))
+                    else:
+                        persisted_segments.append(ForwardSegment(type="text", text="[聊天记录]"))
+                    continue
+
+                placeholder = self._placeholder_for_unknown(segment.type)
+                if placeholder:
+                    persisted_segments.append(ForwardSegment(type="text", text=placeholder))
+
+            if not persisted_segments:
+                persisted_segments.append(ForwardSegment(type="text", text="[空消息]"))
+
+            persisted_nodes.append(
+                ForwardNode(
+                    sender_uin=str(node.sender_uin or ""),
+                    sender_name=str(node.sender_name or node.sender_uin or "未知用户"),
+                    segments=persisted_segments,
+                )
+            )
+
+        return persisted_nodes, image_ids, media_ids
+
+    def _persist_image_asset(
+        self,
+        store: SessionStore,
+        image: PreparedImage,
+        *,
+        created_at: float,
+        created_files: list[Path],
+    ) -> ImageAsset:
+        file_name = f"{random_id()}{image.extension}"
+        abs_path = store.image_abs_path(file_name)
+        abs_path.write_bytes(image.content)
+        created_files.append(abs_path)
+        return ImageAsset(
+            asset_id=random_id("img_"),
+            file_name=file_name,
+            rel_path=rel_image_path(store.session_key, file_name),
+            sha256=image.sha256,
+            dhash=image.dhash,
+            width=image.width,
+            height=image.height,
+            ref_count=1,
+            created_at=created_at,
+        )
+
+    def _persist_media_asset(
+        self,
+        store: SessionStore,
+        media: PreparedMedia,
+        *,
+        created_at: float,
+        created_files: list[Path],
+    ) -> MediaAsset:
+        file_name = f"{random_id()}{media.extension}"
+        abs_path = store.media_abs_path(file_name)
+        abs_path.write_bytes(media.content)
+        created_files.append(abs_path)
+        return MediaAsset(
+            asset_id=random_id("media_"),
+            media_type=media.media_type,
+            file_name=file_name,
+            rel_path=rel_media_path(store.session_key, file_name),
+            display_name=media.display_name or file_name,
+            ref_count=1,
+            created_at=created_at,
+        )
+
+    def _flatten_forward_nodes(self, nodes: list[ForwardNode]) -> str:
+        lines: list[str] = []
+        for node in nodes:
+            parts: list[str] = []
+            for segment in node.segments:
+                if segment.type == "text" and segment.text:
+                    parts.append(segment.text)
+                elif segment.type == "image":
+                    parts.append("[图片]")
+                elif segment.type == "record":
+                    parts.append("[语音]")
+                elif segment.type == "video":
+                    parts.append("[视频]")
+                elif segment.type == "file":
+                    parts.append("[文件]")
+                elif segment.type == "face" and segment.face_id:
+                    parts.append("[表情]")
+                elif segment.type == "at" and segment.qq:
+                    parts.append(f"@{segment.name or segment.qq}")
+                elif segment.type == "nodes":
+                    parts.append("[聊天记录]")
+            content = "".join(parts).strip()
+            if content:
+                lines.append(f"{node.sender_name or node.sender_uin or '未知用户'}：{content}")
+        return "\n".join(lines).strip()
+
     def _has_duplicate(self, images: list[PreparedImage], existing_assets: list[ImageAsset]) -> bool:
         if not images:
             return False
@@ -407,3 +700,15 @@ class QuoteRepository:
             target = target_store.image_abs_path(f"{source.stem}_{random_id()}{source.suffix}")
         shutil.copy2(source, target)
         return target.name
+
+    def _placeholder_for_media(self, media_type: str) -> str:
+        return {
+            "record": "[语音]",
+            "video": "[视频]",
+            "file": "[文件]",
+        }.get(media_type, "[附件]")
+
+    def _placeholder_for_unknown(self, seg_type: str) -> str:
+        if not seg_type:
+            return ""
+        return f"[{seg_type}]"
