@@ -80,10 +80,12 @@ class QuoteService:
             target_qq = explicit_qq
         elif mention_qq:
             target_qq = mention_qq
+        elif reply_qq:
+            target_qq = reply_qq
         elif images.current_images:
             target_qq = str(event.get_sender_id())
         else:
-            target_qq = reply_qq
+            target_qq = ""
 
         if target_qq and target_qq in self.blacklist:
             return CommandResponse(kind="plain", text="该用户在语录黑名单中，本次语录已忽略。")
