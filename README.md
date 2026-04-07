@@ -1,6 +1,6 @@
 <div align="center">
 
-![:name](https://count.getloli.com/@:astrbot_quotes_plugin?name=%3Aastrbot_quotes_plugin&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto]
+![:name](https://count.getloli.com/@:astrbot_quotes_plugin?name=%3Aastrbot_quotes_plugin&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
 # 语录 (Quotes)
 
