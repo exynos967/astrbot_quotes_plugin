@@ -22,10 +22,12 @@ try:
         IMAGE_INDEX_FILENAME,
         IMAGES_DIRNAME,
         LEGACY_QUOTES_BAK_SUFFIX,
+        MAX_SENT_RECORDS,
         MEDIA_DIRNAME,
         MEDIA_INDEX_FILENAME,
         QUOTES_FILENAME,
         SCHEMA_VERSION,
+        SENT_INDEX_FILENAME,
     )
     from .models import (
         ForwardNode,
@@ -37,6 +39,7 @@ try:
         PreparedImage,
         PreparedMedia,
         Quote,
+        SentQuoteRecord,
         QuoteSegment,
     )
     from .utils import (
@@ -56,10 +59,12 @@ except ImportError:  # pragma: no cover
         IMAGE_INDEX_FILENAME,
         IMAGES_DIRNAME,
         LEGACY_QUOTES_BAK_SUFFIX,
+        MAX_SENT_RECORDS,
         MEDIA_DIRNAME,
         MEDIA_INDEX_FILENAME,
         QUOTES_FILENAME,
         SCHEMA_VERSION,
+        SENT_INDEX_FILENAME,
     )
     from models import (
         ForwardNode,
@@ -71,6 +76,7 @@ except ImportError:  # pragma: no cover
         PreparedImage,
         PreparedMedia,
         Quote,
+        SentQuoteRecord,
         QuoteSegment,
     )
     from utils import (
@@ -102,6 +108,7 @@ class SessionStore:
         self.quotes_file = self.root / QUOTES_FILENAME
         self.image_index_file = self.root / IMAGE_INDEX_FILENAME
         self.media_index_file = self.root / MEDIA_INDEX_FILENAME
+        self.sent_index_file = self.root / SENT_INDEX_FILENAME
         self.lock = asyncio.Lock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +175,23 @@ class SessionStore:
     def cache_path(self, quote_id: str) -> Path:
         return self.cache_dir / f"{quote_id}.png"
 
+    def load_sent_records(self) -> list[SentQuoteRecord]:
+        payload = read_json(
+            self.sent_index_file,
+            {"schema_version": SCHEMA_VERSION, "session_key": self.session_key, "sent": []},
+        )
+        return [SentQuoteRecord.from_dict(item) for item in (payload.get("sent") or [])]
+
+    def save_sent_records(self, records: list[SentQuoteRecord]) -> None:
+        atomic_write_json(
+            self.sent_index_file,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "session_key": self.session_key,
+                "sent": [item.to_dict() for item in records],
+            },
+        )
+
 
 class QuoteRepository:
     def __init__(self, plugin_root: Path):
@@ -199,6 +223,61 @@ class QuoteRepository:
             if asset.asset_id == asset_id:
                 return asset
         return None
+
+    def get_quote(self, session_key: str, quote_id: str) -> Quote | None:
+        for quote in self.get_store(session_key).load_quotes():
+            if quote.id == quote_id:
+                return quote
+        return None
+
+    async def record_sent_quote(
+        self,
+        session_key: str,
+        *,
+        quote_id: str,
+        fingerprint: str,
+        sent_at: float,
+    ) -> None:
+        if not quote_id or not fingerprint:
+            return
+        store = self.get_store(session_key)
+        async with store.lock:
+            records = [
+                item
+                for item in store.load_sent_records()
+                if item.quote_id and item.fingerprint
+            ]
+            records.append(
+                SentQuoteRecord(
+                    quote_id=quote_id,
+                    fingerprint=fingerprint,
+                    sent_at=sent_at,
+                )
+            )
+            records = sorted(records, key=lambda item: item.sent_at)
+            if len(records) > MAX_SENT_RECORDS:
+                records = records[-MAX_SENT_RECORDS:]
+            store.save_sent_records(records)
+
+    def find_sent_quote_id(
+        self,
+        session_key: str,
+        *,
+        fingerprint: str,
+        replied_at: float = 0.0,
+    ) -> str | None:
+        if not fingerprint:
+            return None
+        records = self.get_store(session_key).load_sent_records()
+        matches = [item for item in records if item.fingerprint == fingerprint and item.quote_id]
+        if not matches:
+            return None
+        if replied_at > 0:
+            bounded = [item for item in matches if item.sent_at <= replied_at]
+            if bounded:
+                matches = bounded
+        matches.sort(key=lambda item: item.sent_at, reverse=True)
+        return matches[0].quote_id if matches else None
 
     async def create_quote_with_segments(
         self,
@@ -366,8 +445,10 @@ class QuoteRepository:
                     (self.root / asset.rel_path).unlink(missing_ok=True)
 
                 store.cache_path(quote_id).unlink(missing_ok=True)
+                sent_records = [item for item in store.load_sent_records() if item.quote_id != quote_id]
                 store.save_assets(kept_image_assets)
                 store.save_media_assets(kept_media_assets)
+                store.save_sent_records(sent_records)
                 store.save_quotes(quotes)
                 return True
         return False

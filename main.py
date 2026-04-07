@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import time
 from typing import Any
 
 from astrbot.api import logger
@@ -20,7 +21,7 @@ try:
     from .quote_service import QuoteService
     from .renderer import QuoteRenderer
     from .store import QuoteRepository
-    from .utils import ensure_plugin_data_dir, resolve_wake_prefixes
+    from .utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
 except ImportError:  # pragma: no cover
     from constants import PLUGIN_NAME
     from image_service import ImageService
@@ -29,7 +30,7 @@ except ImportError:  # pragma: no cover
     from quote_service import QuoteService
     from renderer import QuoteRenderer
     from store import QuoteRepository
-    from utils import ensure_plugin_data_dir, resolve_wake_prefixes
+    from utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
 
 
 @register(
@@ -68,8 +69,6 @@ class QuotesPlugin(Star):
         self._cfg_poke_probability = self._parse_probability(self.config.get("poke_probability", 20))
         self._cfg_poke_group_whitelist = self._parse_id_set(self.config.get("poke_group_whitelist") or [])
         self._cfg_poke_group_blacklist = self._parse_id_set(self.config.get("poke_group_blacklist") or [])
-        self._pending_qid: dict[str, str] = {}
-        self._last_sent_qid: dict[str, str] = {}
 
     async def initialize(self):
         await self.repository.migrate_legacy_data()
@@ -103,10 +102,9 @@ class QuotesPlugin(Star):
             yield event.plain_result("请先『回复机器人发送的语录』，再发送 删除。")
             return
 
-        session_key = self._session_key(event)
-        quote_id = self._last_sent_qid.get(session_key) or self._pending_qid.get(session_key)
+        quote_id = await self.quote_service.resolve_delete_target(event)
         if not quote_id:
-            yield event.plain_result("未能定位语录，请先重新发送一次随机语录再尝试删除。")
+            yield event.plain_result("未能定位到你回复的那条语录，请确认回复的是机器人发送的语录消息。")
             return
 
         deleted = await self.quote_service.delete_quote(quote_id)
@@ -123,7 +121,7 @@ class QuotesPlugin(Star):
             "- 图文混合：文字和图片会作为同一条语录按顺序保存，发送时使用单条消息链恢复内容。\n"
             "- 聊天记录：回复 QQ 合并转发/聊天记录消息后发送“上传”，会按聊天记录结构保存；发送时按聊天记录格式恢复，支持用 @某人 或 QQ号 覆盖归属。\n"
             "- 语录：随机发送一条语录；可用“语录 @某人”或“语录 12345678”仅随机该用户的语录；若语录含图片，会按原顺序发送图文混合消息。\n"
-            "- 删除：回复机器人刚发送的随机语录消息，发送“删除”或“删除语录”进行删除。\n"
+            "- 删除：回复机器人发送的那条语录消息，发送“删除”或“删除语录”进行精确删除。\n"
             "- 存储：插件数据保存在 AstrBot 的 data/plugin_data/quotes/groups/<群号或private_xxx>/ 目录下，普通图片使用 images/，聊天记录中的语音/视频/文件使用 media/。\n"
             "- 重复图：同一会话内重复上传相同或高度相似的图片时，会拒绝本次上传并提示“语录图片已存在”。"
         )
@@ -170,18 +168,24 @@ class QuotesPlugin(Star):
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent):
         try:
-            session_key = self._session_key(event)
-            quote_id = self._pending_qid.pop(session_key, None)
-            if quote_id:
-                self._last_sent_qid[session_key] = quote_id
+            quote_id = str(event.get_extra("_quotes_sent_quote_id", "") or "")
+            fingerprint = str(event.get_extra("_quotes_sent_fingerprint", "") or "")
+            if quote_id and fingerprint:
+                await self.repository.record_sent_quote(
+                    self._session_key(event),
+                    quote_id=quote_id,
+                    fingerprint=fingerprint,
+                    sent_at=time(),
+                )
         except Exception as exc:
             logger.info(f"after_message_sent 记录失败: {exc}")
 
     def _emit_response(self, event: AstrMessageEvent, response: CommandResponse | None):
         if response is None or response.kind == "none":
             return
-        if response.quote_id:
-            self._pending_qid[self._session_key(event)] = response.quote_id
+        if response.quote_id and response.delete_fingerprint:
+            event.set_extra("_quotes_sent_quote_id", response.quote_id)
+            event.set_extra("_quotes_sent_fingerprint", response.delete_fingerprint)
         if response.kind == "plain":
             yield event.plain_result(response.text)
             return
@@ -195,7 +199,7 @@ class QuotesPlugin(Star):
             yield event.image_result(response.url)
 
     def _session_key(self, event: AstrMessageEvent) -> str:
-        return str(event.get_group_id() or event.unified_msg_origin)
+        return make_session_key(event.get_group_id(), event.get_sender_id())
 
     def _create_http_client(self):
         try:

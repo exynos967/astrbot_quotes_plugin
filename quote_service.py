@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -18,14 +19,26 @@ try:
     from .napcat_service import NapcatService
     from .renderer import QuoteRenderer
     from .store import QuoteRepository
-    from .utils import is_valid_qq, make_session_key, normalize_quote_text, random_id
+    from .utils import (
+        is_valid_qq,
+        make_session_key,
+        normalize_quote_text,
+        random_id,
+        sha256_bytes,
+    )
 except ImportError:  # pragma: no cover
     from constants import DUPLICATE_IMAGE_MESSAGE
     from models import CommandResponse, ForwardNode, ForwardSegment, Quote
     from napcat_service import NapcatService
     from renderer import QuoteRenderer
     from store import QuoteRepository
-    from utils import is_valid_qq, make_session_key, normalize_quote_text, random_id
+    from utils import (
+        is_valid_qq,
+        make_session_key,
+        normalize_quote_text,
+        random_id,
+        sha256_bytes,
+    )
 
 
 class QuoteService:
@@ -198,15 +211,31 @@ class QuoteService:
 
         chain = self.build_quote_chain(quote)
         if chain:
-            return CommandResponse(kind="chain", chain=chain, quote_id=quote.id)
+            return CommandResponse(
+                kind="chain",
+                chain=chain,
+                quote_id=quote.id,
+                delete_fingerprint=await self.build_delete_fingerprint(quote, chain=chain),
+            )
 
         if self.text_mode or quote.kind == "forward":
-            return CommandResponse(kind="plain", text=self._quote_plain_fallback(quote), quote_id=quote.id)
+            text = self._quote_plain_fallback(quote)
+            return CommandResponse(
+                kind="plain",
+                text=text,
+                quote_id=quote.id,
+                delete_fingerprint=self._fingerprint_plain_text(text),
+            )
 
         store = self.repository.get_store(quote.group)
         cache_path = store.cache_path(quote.id)
         if self.render_cache and cache_path.exists():
-            return CommandResponse(kind="image_path", path=str(cache_path), quote_id=quote.id)
+            return CommandResponse(
+                kind="image_path",
+                path=str(cache_path),
+                quote_id=quote.id,
+                delete_fingerprint=await self._fingerprint_image_path(cache_path),
+            )
 
         signature = await self.napcat_service.resolve_signature_name(
             event,
@@ -216,11 +245,48 @@ class QuoteService:
         rendered_url = await self.renderer.render_quote_image(quote, signature)
         cached = await self.cache_rendered_result(rendered_url, cache_path)
         if cached:
-            return CommandResponse(kind="image_path", path=str(cache_path), quote_id=quote.id)
-        return CommandResponse(kind="image_url", url=rendered_url, quote_id=quote.id)
+            return CommandResponse(
+                kind="image_path",
+                path=str(cache_path),
+                quote_id=quote.id,
+                delete_fingerprint=await self._fingerprint_image_path(cache_path),
+            )
+        return CommandResponse(
+            kind="image_url",
+            url=rendered_url,
+            quote_id=quote.id,
+            delete_fingerprint=await self._fingerprint_image_url(rendered_url),
+        )
 
     async def delete_quote(self, quote_id: str) -> bool:
         return await self.repository.delete_quote(quote_id)
+
+    async def resolve_delete_target(self, event: Any) -> str | None:
+        session_key = make_session_key(event.get_group_id(), event.get_sender_id())
+        reply_message_id = self.get_reply_message_id(event)
+        if not reply_message_id:
+            return None
+
+        reply_payload = await self.napcat_service.fetch_onebot_message(event, reply_message_id)
+        if not reply_payload:
+            return None
+
+        sender = reply_payload.get("sender") or {}
+        sender_id = str(sender.get("user_id") or sender.get("qq") or "")
+        self_id = self._self_id_of_event(event)
+        if self_id and sender_id and sender_id != self_id:
+            return None
+
+        fingerprint = await self._fingerprint_from_reply_payload(event, reply_payload)
+        if not fingerprint:
+            return None
+
+        replied_at = float(reply_payload.get("time") or 0)
+        return self.repository.find_sent_quote_id(
+            session_key,
+            fingerprint=fingerprint,
+            replied_at=replied_at,
+        )
 
     def build_quote_chain(self, quote: Quote) -> list[Any]:
         if Comp is None:
@@ -457,6 +523,316 @@ class QuoteService:
         if quote.kind == "forward":
             return quote.text or f"{quote.name} 的聊天记录语录"
         return f"「{quote.text}」 — {quote.name}"
+
+    async def build_delete_fingerprint(self, quote: Quote, *, chain: list[Any] | None = None) -> str:
+        if quote.kind == "forward":
+            return self._fingerprint_forward_nodes(quote.group, quote.forward_nodes)
+
+        if chain:
+            fingerprint = await self._fingerprint_standard_chain(chain)
+            if fingerprint:
+                return fingerprint
+
+        return self._fingerprint_standard_quote(quote)
+
+    async def _fingerprint_from_reply_payload(self, event: Any, reply_payload: dict[str, Any]) -> str:
+        message = reply_payload.get("message")
+        forward_id, forward_payload = self.napcat_service.extract_forward_reference(message)
+        if forward_id or forward_payload:
+            nodes = await self.image_service.build_forward_nodes(
+                event,
+                forward_id=forward_id,
+                forward_payload=forward_payload,
+                forward_loader=self.napcat_service.fetch_forward_messages,
+            )
+            if nodes:
+                return self._fingerprint_pending_forward_nodes(nodes)
+
+        segments = await self.image_service.build_reply_segments(event, message)
+        normalized = self._normalize_pending_segments(segments)
+        if not normalized:
+            return ""
+
+        if len(normalized) == 1 and normalized[0].type == "image" and normalized[0].image is not None:
+            return self._fingerprint_image_sha(normalized[0].image.sha256)
+
+        return self._hash_payload(
+            {
+                "kind": "chain",
+                "parts": [
+                    self._pending_segment_payload(segment)
+                    for segment in normalized
+                ],
+            }
+        )
+
+    def _fingerprint_plain_text(self, text: str) -> str:
+        normalized = self._canonical_text(normalize_quote_text(text))
+        if not normalized:
+            return ""
+        return self._hash_payload(
+            {"kind": "chain", "parts": [{"type": "text", "text": normalized}]}
+        )
+
+    def _fingerprint_standard_quote(self, quote: Quote) -> str:
+        if not quote.segments:
+            return ""
+        parts = [self._stored_standard_segment_payload(quote.group, segment) for segment in quote.segments]
+        parts = [item for item in parts if item is not None]
+        if not parts:
+            return ""
+        return self._hash_payload({"kind": "chain", "parts": parts})
+
+    async def _fingerprint_standard_chain(self, chain: list[Any]) -> str:
+        parts: list[dict[str, Any]] = []
+        for component in chain:
+            payload = await self._component_payload(component)
+            if payload is not None:
+                parts.append(payload)
+        if not parts:
+            return ""
+        return self._hash_payload({"kind": "chain", "parts": parts})
+
+    async def _fingerprint_image_path(self, path: Path) -> str:
+        try:
+            if path.exists():
+                return self._fingerprint_image_sha(sha256_bytes(path.read_bytes()))
+        except Exception as exc:
+            logger.info(f"计算语录图片指纹失败: {exc}")
+        return ""
+
+    async def _fingerprint_image_url(self, url: str) -> str:
+        if not url:
+            return ""
+        try:
+            if url.startswith("file://"):
+                from urllib.parse import unquote, urlparse
+
+                parsed = urlparse(url)
+                local_path = Path(unquote(parsed.path))
+                return await self._fingerprint_image_path(local_path)
+
+            if url.startswith("http") and self.http_client is not None:
+                response = await self.http_client.get(url)
+                if getattr(response, "status_code", 200) < 400:
+                    return self._fingerprint_image_sha(sha256_bytes(bytes(response.content)))
+        except Exception as exc:
+            logger.info(f"计算语录图片 URL 指纹失败: {exc}")
+        return ""
+
+    async def _component_payload(self, component: Any) -> dict[str, Any] | None:
+        if Comp is None:
+            return None
+
+        if isinstance(component, Comp.Plain):
+            text = self._canonical_text(str(getattr(component, "text", "") or ""))
+            return {"type": "text", "text": text} if text else None
+
+        if isinstance(component, Comp.Image):
+            image_hash = await self._hash_component_file(component)
+            return {"type": "image", "sha256": image_hash} if image_hash else None
+
+        if isinstance(component, Comp.Record):
+            media_hash = await self._hash_component_file(component)
+            return {"type": "record", "sha256": media_hash} if media_hash else {"type": "record", "text": "[语音]"}
+
+        if isinstance(component, Comp.Video):
+            media_hash = await self._hash_component_file(component)
+            return {"type": "video", "sha256": media_hash} if media_hash else {"type": "video", "text": "[视频]"}
+
+        if isinstance(component, Comp.File):
+            media_hash = await self._hash_component_file(component)
+            if media_hash:
+                return {"type": "file", "sha256": media_hash}
+            return {"type": "file", "name": str(getattr(component, "name", "") or "")}
+
+        if isinstance(component, Comp.At):
+            return {
+                "type": "at",
+                "qq": str(getattr(component, "qq", "") or ""),
+                "name": str(getattr(component, "name", "") or ""),
+            }
+
+        if isinstance(component, Comp.Face):
+            return {"type": "face", "face_id": int(getattr(component, "id", 0) or 0)}
+
+        if isinstance(component, Comp.Node):
+            nested = await self._fingerprint_node_component(component)
+            return nested
+
+        if isinstance(component, Comp.Nodes):
+            nested_nodes = []
+            for node in list(getattr(component, "nodes", []) or []):
+                node_payload = await self._fingerprint_node_component(node)
+                if node_payload is not None:
+                    nested_nodes.append(node_payload)
+            return {"type": "nodes", "nodes": nested_nodes} if nested_nodes else None
+
+        return None
+
+    async def _fingerprint_node_component(self, node: Any) -> dict[str, Any] | None:
+        content = []
+        for component in list(getattr(node, "content", []) or []):
+            payload = await self._component_payload(component)
+            if payload is not None:
+                content.append(payload)
+        return {
+            "sender_uin": str(getattr(node, "uin", "") or ""),
+            "sender_name": str(getattr(node, "name", "") or ""),
+            "segments": content,
+        }
+
+    async def _hash_component_file(self, component: Any) -> str:
+        for attr in ("path", "file"):
+            raw_value = getattr(component, attr, None)
+            path_hash = await self._hash_local_or_remote_file(raw_value)
+            if path_hash:
+                return path_hash
+        return ""
+
+    async def _hash_local_or_remote_file(self, raw_value: Any) -> str:
+        value = str(raw_value or "").strip()
+        if not value:
+            return ""
+        try:
+            if value.startswith("file:///"):
+                value = value[8:]
+            elif value.startswith("file://"):
+                value = value[7:]
+            path = Path(value)
+            if path.exists():
+                return sha256_bytes(path.read_bytes())
+            if value.startswith("http") and self.http_client is not None:
+                response = await self.http_client.get(value)
+                if getattr(response, "status_code", 200) < 400:
+                    return sha256_bytes(bytes(response.content))
+        except Exception as exc:
+            logger.info(f"计算媒体文件指纹失败: {exc}")
+        return ""
+
+    def _fingerprint_image_sha(self, sha_value: str) -> str:
+        return self._hash_payload({"kind": "image", "sha256": str(sha_value or "")})
+
+    def _stored_standard_segment_payload(self, session_key: str, segment: Any) -> dict[str, Any] | None:
+        if segment.type == "text":
+            text = self._canonical_text(str(segment.text or ""))
+            return {"type": "text", "text": text} if text else None
+        if segment.type == "image" and segment.asset_id:
+            asset = self.repository.find_asset(session_key, segment.asset_id)
+            if asset is not None and asset.sha256:
+                return {"type": "image", "sha256": asset.sha256}
+            return {"type": "image", "asset_id": segment.asset_id}
+        return None
+
+    def _pending_segment_payload(self, segment: Any) -> dict[str, Any] | None:
+        if segment.type == "text":
+            text = self._canonical_text(str(segment.text or ""))
+            return {"type": "text", "text": text} if text else None
+        if segment.type == "image" and getattr(segment, "image", None) is not None:
+            return {"type": "image", "sha256": str(segment.image.sha256 or "")}
+        return None
+
+    def _fingerprint_forward_nodes(self, session_key: str, nodes: list[ForwardNode]) -> str:
+        payload = [self._stored_forward_node_payload(session_key, node) for node in nodes]
+        payload = [item for item in payload if item is not None]
+        if not payload:
+            return ""
+        return self._hash_payload({"kind": "forward", "nodes": payload})
+
+    def _fingerprint_pending_forward_nodes(self, nodes: list[Any]) -> str:
+        payload = [self._pending_forward_node_payload(node) for node in nodes]
+        payload = [item for item in payload if item is not None]
+        if not payload:
+            return ""
+        return self._hash_payload({"kind": "forward", "nodes": payload})
+
+    def _stored_forward_node_payload(self, session_key: str, node: ForwardNode) -> dict[str, Any] | None:
+        segments = [self._stored_forward_segment_payload(session_key, segment) for segment in node.segments]
+        segments = [item for item in segments if item is not None]
+        return {
+            "sender_uin": str(node.sender_uin or ""),
+            "sender_name": str(node.sender_name or ""),
+            "segments": segments,
+        }
+
+    def _stored_forward_segment_payload(self, session_key: str, segment: ForwardSegment) -> dict[str, Any] | None:
+        if segment.type == "text":
+            text = self._canonical_text(str(segment.text or ""))
+            return {"type": "text", "text": text} if text else None
+        if segment.type == "image" and segment.asset_id:
+            asset = self.repository.find_asset(session_key, segment.asset_id)
+            if asset is not None and asset.sha256:
+                return {"type": "image", "sha256": asset.sha256}
+            return {"type": "image", "asset_id": segment.asset_id}
+        if segment.type in {"record", "video", "file"} and segment.asset_id:
+            asset = self.repository.find_media_asset(session_key, segment.asset_id)
+            if asset is not None:
+                abs_path = self.repository.root / asset.rel_path
+                if abs_path.exists():
+                    return {"type": segment.type, "sha256": sha256_bytes(abs_path.read_bytes())}
+            return {"type": segment.type, "asset_id": segment.asset_id}
+        if segment.type == "face" and segment.face_id:
+            return {"type": "face", "face_id": int(segment.face_id)}
+        if segment.type == "at" and segment.qq:
+            return {"type": "at", "qq": str(segment.qq), "name": str(segment.name or "")}
+        if segment.type == "nodes":
+            nested = [self._stored_forward_node_payload(session_key, node) for node in segment.nodes]
+            nested = [item for item in nested if item is not None]
+            return {"type": "nodes", "nodes": nested} if nested else {"type": "text", "text": "[聊天记录]"}
+        placeholder = self._placeholder_for_unknown(segment.type)
+        return {"type": "text", "text": placeholder} if placeholder else None
+
+    def _pending_forward_node_payload(self, node: Any) -> dict[str, Any] | None:
+        segments = [self._pending_forward_segment_payload(segment) for segment in getattr(node, "segments", [])]
+        segments = [item for item in segments if item is not None]
+        return {
+            "sender_uin": str(getattr(node, "sender_uin", "") or ""),
+            "sender_name": str(getattr(node, "sender_name", "") or ""),
+            "segments": segments,
+        }
+
+    def _pending_forward_segment_payload(self, segment: Any) -> dict[str, Any] | None:
+        if segment.type == "text":
+            text = self._canonical_text(str(segment.text or ""))
+            return {"type": "text", "text": text} if text else None
+        if segment.type == "image" and getattr(segment, "image", None) is not None:
+            return {"type": "image", "sha256": str(segment.image.sha256 or "")}
+        if segment.type in {"record", "video", "file"} and getattr(segment, "media", None) is not None:
+            return {"type": segment.type, "sha256": sha256_bytes(segment.media.content)}
+        if segment.type == "face" and getattr(segment, "face_id", 0):
+            return {"type": "face", "face_id": int(segment.face_id)}
+        if segment.type == "at" and getattr(segment, "qq", ""):
+            return {"type": "at", "qq": str(segment.qq), "name": str(segment.name or "")}
+        if segment.type == "nodes":
+            nested = [self._pending_forward_node_payload(node) for node in getattr(segment, "nodes", [])]
+            nested = [item for item in nested if item is not None]
+            return {"type": "nodes", "nodes": nested} if nested else {"type": "text", "text": "[聊天记录]"}
+        placeholder = self._placeholder_for_unknown(segment.type)
+        return {"type": "text", "text": placeholder} if placeholder else None
+
+    def _canonical_text(self, text: str) -> str:
+        return str(text or "").replace("\r\n", "\n").strip()
+
+    def _hash_payload(self, payload: dict[str, Any]) -> str:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return sha256_bytes(canonical.encode("utf-8"))
+
+    def _self_id_of_event(self, event: Any) -> str:
+        for getter in (
+            lambda: getattr(event, "get_self_id", lambda: "")(),
+            lambda: getattr(getattr(event, "message_obj", None), "self_id", None),
+            lambda: getattr(event, "self_id", None),
+            lambda: (getattr(event, "raw_event", None) or {}).get("self_id")
+            if isinstance(getattr(event, "raw_event", None), dict)
+            else None,
+        ):
+            try:
+                value = getter()
+            except Exception:
+                value = None
+            if value:
+                return str(value)
+        return ""
 
     def _placeholder_for_media(self, media_type: str) -> str:
         return {

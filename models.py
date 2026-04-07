@@ -285,7 +285,26 @@ class CommandResponse:
     path: str = ""
     url: str = ""
     quote_id: str = ""
+    delete_fingerprint: str = ""
     chain: list[Any] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SentQuoteRecord:
+    quote_id: str
+    fingerprint: str
+    sent_at: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SentQuoteRecord":
+        return cls(
+            quote_id=str(data.get("quote_id") or ""),
+            fingerprint=str(data.get("fingerprint") or ""),
+            sent_at=float(data.get("sent_at") or 0),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
