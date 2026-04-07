@@ -1,6 +1,12 @@
+<div align="center">
+
+![:name](https://count.getloli.com/@:astrbot_quotes_plugin?name=%3Aastrbot_quotes_plugin&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto]
+
 # 语录 (Quotes)
 
 一个用于 AstrBot 的 QQ 群聊语录记录插件。群友的金句、搞笑发言、经典语录，一键收藏、随机回顾。
+
+</div>
 
 ## 功能
 
