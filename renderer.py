@@ -12,14 +12,31 @@ except ImportError:  # pragma: no cover
 
 
 class QuoteRenderer:
-    def __init__(self, html_render: Callable[[str, dict[str, Any], dict[str, Any]], Awaitable[str]], image_config: dict[str, Any]):
+    def __init__(
+        self,
+        html_render: Callable[[str, dict[str, Any], bool, dict[str, Any] | None], Awaitable[str]],
+        image_config: dict[str, Any],
+    ):
         self._html_render = html_render
         self.image_config = image_config or {}
+
+    async def _render_template(
+        self,
+        template: str,
+        data: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> str:
+        return await self._html_render(
+            template,
+            data,
+            True,
+            options,
+        )
 
     async def warmup(self) -> None:
         minimal = '<div style="width:320px;height:120px;background:#000;color:#fff">init</div>'
         try:
-            await self._html_render(
+            await self._render_template(
                 minimal,
                 {},
                 {"full_page": False, "clip": {"x": 0, "y": 0, "width": 320, "height": 120}},
@@ -90,7 +107,7 @@ class QuoteRenderer:
         </body>
         </html>
         """
-        return await self._html_render(
+        return await self._render_template(
             template,
             {},
             {
