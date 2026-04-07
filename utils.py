@@ -78,6 +78,42 @@ def ensure_plugin_data_dir(storage: str | None = None, plugin_name: str = PLUGIN
     return root.resolve()
 
 
+def resolve_wake_prefixes(config_obj: Any) -> tuple[str, ...]:
+    default_prefixes = ("/", "#", "=", "!", "／", "！")
+    if config_obj is None:
+        return default_prefixes
+
+    wake_prefix: Any = None
+    if hasattr(config_obj, "get"):
+        try:
+            wake_prefix = config_obj.get("wake_prefix")
+        except Exception:
+            wake_prefix = None
+
+    if wake_prefix is None and isinstance(config_obj, dict):
+        wake_prefix = config_obj.get("wake_prefix")
+
+    if wake_prefix is None:
+        return default_prefixes
+
+    if isinstance(wake_prefix, str):
+        prefixes = [wake_prefix]
+    elif isinstance(wake_prefix, (list, tuple, set)):
+        prefixes = [str(item) for item in wake_prefix if str(item)]
+    else:
+        return default_prefixes
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for prefix in [*prefixes, *default_prefixes]:
+        value = str(prefix or "")
+        if not value or value in seen:
+            continue
+        merged.append(value)
+        seen.add(value)
+    return tuple(merged)
+
+
 def make_session_key(group_id: str | None, sender_id: str | None) -> str:
     gid = str(group_id or "").strip()
     if gid:

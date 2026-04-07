@@ -21,8 +21,21 @@ except ImportError:  # pragma: no cover
 
 
 class ImageService:
-    def __init__(self, http_client: Any | None = None):
+    def __init__(
+        self,
+        http_client: Any | None = None,
+        *,
+        wake_prefixes: tuple[str, ...] | list[str] | None = None,
+    ):
         self.http_client = http_client
+        prefixes = [str(item) for item in (wake_prefixes or ()) if str(item)]
+        self.wake_prefixes = tuple(
+            sorted(
+                dict.fromkeys(prefixes),
+                key=len,
+                reverse=True,
+            )
+        )
 
     async def collect_images(
         self,
@@ -79,9 +92,7 @@ class ImageService:
                 if Comp is not None and isinstance(raw_segment, Comp.Plain):
                     text = str(getattr(raw_segment, "text", "") or "")
                     if not first_plain_consumed:
-                        text = text.strip()
-                        if command_name and text.startswith(command_name):
-                            text = text[len(command_name) :].strip()
+                        text = self._strip_command_invocation(text, command_name)
                         if explicit_qq and text.startswith(explicit_qq):
                             text = text[len(explicit_qq) :].strip()
                         first_plain_consumed = True
@@ -209,3 +220,16 @@ class ImageService:
         except Exception as exc:
             logger.info(f"get_image 回退失败: {exc}")
             return None
+
+    def _strip_command_invocation(self, text: str, command_name: str) -> str:
+        text = text.strip()
+        if not text or not command_name:
+            return text
+
+        if text.startswith(command_name):
+            return text[len(command_name) :].strip()
+
+        for prefix in self.wake_prefixes:
+            if text.startswith(f"{prefix}{command_name}"):
+                return text[len(prefix) + len(command_name) :].strip()
+        return text

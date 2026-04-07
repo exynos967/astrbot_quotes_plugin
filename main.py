@@ -20,7 +20,7 @@ try:
     from .quote_service import QuoteService
     from .renderer import QuoteRenderer
     from .store import QuoteRepository
-    from .utils import ensure_plugin_data_dir
+    from .utils import ensure_plugin_data_dir, resolve_wake_prefixes
 except ImportError:  # pragma: no cover
     from constants import PLUGIN_NAME
     from image_service import ImageService
@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
     from quote_service import QuoteService
     from renderer import QuoteRenderer
     from store import QuoteRepository
-    from utils import ensure_plugin_data_dir
+    from utils import ensure_plugin_data_dir, resolve_wake_prefixes
 
 
 @register(
@@ -47,7 +47,10 @@ class QuotesPlugin(Star):
         self.data_root = ensure_plugin_data_dir(str(self.config.get("storage") or "").strip(), PLUGIN_NAME)
         self.repository = QuoteRepository(self.data_root)
         self.napcat_service = NapcatService()
-        self.image_service = ImageService(self.http_client)
+        self.image_service = ImageService(
+            self.http_client,
+            wake_prefixes=resolve_wake_prefixes(self._resolve_context_config()),
+        )
         self.renderer = QuoteRenderer(self.html_render, self.config.get("image") or {})
         self.quote_service = QuoteService(
             repository=self.repository,
@@ -200,6 +203,22 @@ class QuotesPlugin(Star):
             return httpx.AsyncClient(timeout=20)
         except Exception:
             return None
+
+    def _resolve_context_config(self):
+        getter = getattr(self, "_get_context_config", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                pass
+
+        getter = getattr(self.context, "get_config", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                pass
+        return getattr(self.context, "_config", None)
 
     def _parse_blacklist(self) -> set[str]:
         raw = self.config.get("blacklist")
