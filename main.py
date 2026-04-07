@@ -117,7 +117,8 @@ class QuotesPlugin(Star):
         help_text = (
             "语录插件帮助\n"
             "- 上传：先回复某人的消息，再发送“上传”（可附带图片）保存为语录。默认归属给被回复的人；若同时写“上传 @某人”或“上传 12345678”，则会覆盖默认归属，改为指定对象；不回复且不指定时默认归属上传者。\n"
-            "- 语录：随机发送一条语录；可用“语录 @某人”或“语录 12345678”仅随机该用户的语录；若含用户上传图片，将直接发送原图。\n"
+            "- 图文混合：文字和图片会作为同一条语录按顺序保存，发送时使用单条消息链恢复内容。\n"
+            "- 语录：随机发送一条语录；可用“语录 @某人”或“语录 12345678”仅随机该用户的语录；若语录含图片，会按原顺序发送图文混合消息。\n"
             "- 删除：回复机器人刚发送的随机语录消息，发送“删除”或“删除语录”进行删除。\n"
             "- 存储：插件数据保存在 AstrBot 的 data/plugin_data/quotes/groups/<群号或private_xxx>/ 目录下。\n"
             "- 重复图：同一会话内重复上传相同或高度相似的图片时，会拒绝本次上传并提示“语录图片已存在”。"
@@ -179,6 +180,9 @@ class QuotesPlugin(Star):
             self._pending_qid[self._session_key(event)] = response.quote_id
         if response.kind == "plain":
             yield event.plain_result(response.text)
+            return
+        if response.kind == "chain":
+            yield event.chain_result(response.chain)
             return
         if response.kind == "image_path":
             yield event.chain_result([Comp.Image.fromFileSystem(response.path)])

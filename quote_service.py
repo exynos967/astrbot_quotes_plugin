@@ -62,18 +62,15 @@ class QuoteService:
         reply_qq = str(reply_sender.get("user_id") or reply_sender.get("qq") or "")
         explicit_qq = uid.strip() if is_valid_qq(uid) else ""
 
-        target_text = self.extract_plaintext_from_onebot_message(reply_payload.get("message"))
-        if not target_text:
-            target_text = self.extract_plaintext_from_segments(event, command_name="上传")
-        if explicit_qq and target_text.startswith(explicit_qq):
-            target_text = target_text[len(explicit_qq) :].strip()
-        target_text = normalize_quote_text(target_text)
-
-        images = await self.image_service.collect_images(event, reply_payload.get("message"))
-        if not target_text and not images.all_images:
+        reply_segments = await self.image_service.build_reply_segments(event, reply_payload.get("message"))
+        current_segments = await self.image_service.build_current_segments(
+            event,
+            command_name="上传",
+            explicit_qq=explicit_qq,
+        )
+        all_segments = self._normalize_pending_segments([*reply_segments, *current_segments])
+        if not all_segments:
             return CommandResponse(kind="plain", text="未获取到被回复消息内容或图片，请确认已正确回复对方的消息或附带图片。")
-        if not target_text and images.all_images:
-            target_text = "[图片]"
 
         mention_qq = self.extract_at_qq(event) or ""
         if explicit_qq:
@@ -82,7 +79,7 @@ class QuoteService:
             target_qq = mention_qq
         elif reply_qq:
             target_qq = reply_qq
-        elif images.current_images:
+        elif current_segments:
             target_qq = str(event.get_sender_id())
         else:
             target_qq = ""
@@ -100,19 +97,19 @@ class QuoteService:
             id=random_id("q_"),
             qq=str(target_qq or ""),
             name=str(target_name),
-            text=str(target_text),
+            text=self._plain_text_from_pending_segments(all_segments),
             created_by=str(event.get_sender_id()),
             created_at=time(),
             group=session_key,
         )
-        result = await self.repository.create_quote_with_images(session_key, quote, images.all_images)
+        result = await self.repository.create_quote_with_segments(session_key, quote, all_segments)
         if result.duplicate:
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
 
-        image_count = len(images.all_images)
+        image_count = len([segment for segment in all_segments if segment.type == "image"])
         if image_count:
             return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。")
-        return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录：{target_text}")
+        return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录：{quote.text}")
 
     async def random_quote(self, event: Any, uid: str = "", silent_if_empty: bool = False) -> CommandResponse | None:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
@@ -129,10 +126,9 @@ class QuoteService:
                 text = "还没有语录，先用 上传 保存一条吧~" if self.global_mode else "本会话还没有语录，先用 上传 保存一条吧~"
             return CommandResponse(kind="plain", text=text)
 
-        if quote.image_ids:
-            image_path = self.resolve_random_image_path(quote)
-            if image_path:
-                return CommandResponse(kind="image_path", path=image_path, quote_id=quote.id)
+        chain = self.build_quote_chain(quote)
+        if chain:
+            return CommandResponse(kind="chain", chain=chain, quote_id=quote.id)
 
         if self.text_mode:
             return CommandResponse(kind="plain", text=f"「{quote.text}」 — {quote.name}", quote_id=quote.id)
@@ -156,18 +152,31 @@ class QuoteService:
     async def delete_quote(self, quote_id: str) -> bool:
         return await self.repository.delete_quote(quote_id)
 
-    def resolve_random_image_path(self, quote: Quote) -> str:
-        import secrets
+    def build_quote_chain(self, quote: Quote) -> list[Any]:
+        if Comp is None:
+            return []
+        if not quote.segments:
+            return []
+        has_image = any(segment.type == "image" and segment.asset_id for segment in quote.segments)
+        if not has_image:
+            return []
 
-        assets = [self.repository.find_asset(quote.group, image_id) for image_id in quote.image_ids]
-        assets = [item for item in assets if item is not None]
-        if not assets:
-            return ""
-        asset = secrets.choice(assets)
-        abs_path = self.repository.root / asset.rel_path
-        if abs_path.exists():
-            return str(abs_path)
-        return ""
+        chain: list[Any] = []
+        for segment in quote.segments:
+            if segment.type == "text":
+                text = str(segment.text or "").strip()
+                if text:
+                    chain.append(Comp.Plain(text))
+                continue
+            if segment.type != "image" or not segment.asset_id:
+                continue
+            asset = self.repository.find_asset(quote.group, segment.asset_id)
+            if asset is None:
+                continue
+            abs_path = self.repository.root / asset.rel_path
+            if abs_path.exists():
+                chain.append(Comp.Image.fromFileSystem(str(abs_path)))
+        return chain
 
     async def cache_rendered_result(self, rendered_url: str, cache_path: Path) -> bool:
         if not self.render_cache:
@@ -240,3 +249,20 @@ class QuoteService:
         if command_name and text.startswith(command_name):
             text = text[len(command_name) :].strip()
         return normalize_quote_text(text)
+
+    def _normalize_pending_segments(self, segments: list[Any]) -> list[Any]:
+        normalized: list[Any] = []
+        for segment in segments:
+            if segment.type == "text":
+                text = normalize_quote_text(str(segment.text or ""))
+                if text:
+                    segment.text = text
+                    normalized.append(segment)
+                continue
+            if segment.type == "image" and getattr(segment, "image", None) is not None:
+                normalized.append(segment)
+        return normalized
+
+    def _plain_text_from_pending_segments(self, segments: list[Any]) -> str:
+        parts = [str(segment.text or "") for segment in segments if segment.type == "text" and str(segment.text or "").strip()]
+        return " ".join(parts).strip()

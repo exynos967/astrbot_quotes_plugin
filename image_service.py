@@ -13,10 +13,10 @@ except Exception:  # pragma: no cover
     Comp = None  # type: ignore
 
 try:
-    from .models import ImageCollection, PreparedImage
+    from .models import ImageCollection, PendingQuoteSegment, PreparedImage
     from .utils import prepare_image
 except ImportError:  # pragma: no cover
-    from models import ImageCollection, PreparedImage
+    from models import ImageCollection, PendingQuoteSegment, PreparedImage
     from utils import prepare_image
 
 
@@ -32,6 +32,79 @@ class ImageService:
         reply_images = await self._collect_from_onebot_message(event, reply_message)
         current_images = await self._collect_from_segments(event)
         return ImageCollection(reply_images=reply_images, current_images=current_images)
+
+    async def build_reply_segments(self, event: Any, message: Any) -> list[PendingQuoteSegment]:
+        if not isinstance(message, list):
+            return []
+        segments: list[PendingQuoteSegment] = []
+        for segment in message:
+            try:
+                seg_type = str(segment.get("type") or "").lower()
+                if seg_type in {"text", "plain"}:
+                    text = str((segment.get("data") or {}).get("text") or "")
+                    if text:
+                        segments.append(PendingQuoteSegment(type="text", text=text))
+                    continue
+                if seg_type != "image":
+                    continue
+                data = segment.get("data") or {}
+                prepared = await self._prepare_from_onebot_data(event, data)
+                if prepared is not None:
+                    segments.append(PendingQuoteSegment(type="image", image=prepared))
+            except Exception as exc:
+                logger.warning(f"构建回复消息段失败: {exc}")
+        return segments
+
+    async def build_current_segments(
+        self,
+        event: Any,
+        *,
+        command_name: str,
+        explicit_qq: str = "",
+    ) -> list[PendingQuoteSegment]:
+        segments: list[PendingQuoteSegment] = []
+        first_plain_consumed = False
+        try:
+            message_segments = list(event.get_messages())
+        except Exception as exc:
+            logger.warning(f"读取当前消息链失败: {exc}")
+            return segments
+
+        for raw_segment in message_segments:
+            try:
+                if Comp is not None and isinstance(raw_segment, Comp.Reply):
+                    continue
+                if Comp is not None and isinstance(raw_segment, Comp.At):
+                    continue
+                if Comp is not None and isinstance(raw_segment, Comp.Plain):
+                    text = str(getattr(raw_segment, "text", "") or "")
+                    if not first_plain_consumed:
+                        text = text.strip()
+                        if command_name and text.startswith(command_name):
+                            text = text[len(command_name) :].strip()
+                        if explicit_qq and text.startswith(explicit_qq):
+                            text = text[len(explicit_qq) :].strip()
+                        first_plain_consumed = True
+                    if text:
+                        segments.append(PendingQuoteSegment(type="text", text=text))
+                    continue
+                if Comp is not None and isinstance(raw_segment, Comp.Image):
+                    url = getattr(raw_segment, "url", None)
+                    file_or_path = getattr(raw_segment, "file", None) or getattr(raw_segment, "path", None)
+                    prepared = None
+                    if url and str(url).startswith(("http://", "https://")):
+                        prepared = await self._prepare_from_url(str(url))
+                    elif file_or_path:
+                        prepared = await self._prepare_from_fs(str(file_or_path))
+                        if prepared is None and event.get_platform_name() == "aiocqhttp":
+                            local_path = await self._resolve_napcat_image_path(event, str(file_or_path))
+                            if local_path:
+                                prepared = await self._prepare_from_fs(local_path)
+                    if prepared is not None:
+                        segments.append(PendingQuoteSegment(type="image", image=prepared))
+            except Exception as exc:
+                logger.warning(f"构建当前消息段失败: {exc}")
+        return segments
 
     async def _collect_from_onebot_message(self, event: Any, message: Any) -> list[PreparedImage]:
         if not isinstance(message, list):

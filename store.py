@@ -25,7 +25,7 @@ try:
         QUOTES_FILENAME,
         SCHEMA_VERSION,
     )
-    from .models import ImageAsset, PreparedImage, Quote
+    from .models import ImageAsset, PendingQuoteSegment, PreparedImage, Quote, QuoteSegment
     from .utils import (
         atomic_write_json,
         is_near_duplicate,
@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
         QUOTES_FILENAME,
         SCHEMA_VERSION,
     )
-    from models import ImageAsset, PreparedImage, Quote
+    from models import ImageAsset, PendingQuoteSegment, PreparedImage, Quote, QuoteSegment
     from utils import (
         atomic_write_json,
         is_near_duplicate,
@@ -143,16 +143,17 @@ class QuoteRepository:
                 return asset
         return None
 
-    async def create_quote_with_images(
+    async def create_quote_with_segments(
         self,
         session_key: str,
         quote: Quote,
-        images: list[PreparedImage],
+        segments: list[PendingQuoteSegment],
     ) -> CreateQuoteResult:
         store = self.get_store(session_key)
         async with store.lock:
             quotes = store.load_quotes()
             assets = store.load_assets()
+            images = [segment.image for segment in segments if segment.type == "image" and segment.image is not None]
             if self._has_duplicate(images, assets):
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
@@ -161,26 +162,45 @@ class QuoteRepository:
             created_assets: list[ImageAsset] = []
             created_files: list[Path] = []
             try:
-                for image in images:
+                persisted_segments: list[QuoteSegment] = []
+                for segment in segments:
+                    if segment.type == "text":
+                        text = str(segment.text or "").strip()
+                        if text:
+                            persisted_segments.append(QuoteSegment(type="text", text=text))
+                        continue
+
+                    image = segment.image
+                    if segment.type != "image" or image is None:
+                        continue
+
                     file_name = f"{random_id()}{image.extension}"
                     abs_path = store.image_abs_path(file_name)
                     abs_path.write_bytes(image.content)
                     created_files.append(abs_path)
-                    created_assets.append(
-                        ImageAsset(
-                            asset_id=random_id("img_"),
-                            file_name=file_name,
-                            rel_path=rel_image_path(session_key, file_name),
-                            sha256=image.sha256,
-                            dhash=image.dhash,
-                            width=image.width,
-                            height=image.height,
-                            ref_count=1,
-                            created_at=time(),
+                    asset = ImageAsset(
+                        asset_id=random_id("img_"),
+                        file_name=file_name,
+                        rel_path=rel_image_path(session_key, file_name),
+                        sha256=image.sha256,
+                        dhash=image.dhash,
+                        width=image.width,
+                        height=image.height,
+                        ref_count=1,
+                        created_at=time(),
+                    )
+                    created_assets.append(asset)
+                    persisted_segments.append(
+                        QuoteSegment(
+                            type="image",
+                            asset_id=asset.asset_id,
                         )
                     )
 
+                quote.segments = persisted_segments
                 quote.image_ids = [item.asset_id for item in created_assets]
+                if not quote.text:
+                    quote.text = " ".join(segment.text for segment in persisted_segments if segment.type == "text").strip()
                 quotes.append(quote)
                 assets.extend(created_assets)
                 store.save_assets(assets)

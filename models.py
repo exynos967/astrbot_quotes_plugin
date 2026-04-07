@@ -5,6 +5,24 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class QuoteSegment:
+    type: str
+    text: str = ""
+    asset_id: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "QuoteSegment":
+        return cls(
+            type=str(data.get("type") or ""),
+            text=str(data.get("text") or ""),
+            asset_id=str(data.get("asset_id") or ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class Quote:
     id: str
     qq: str
@@ -14,9 +32,24 @@ class Quote:
     created_at: float
     group: str = ""
     image_ids: list[str] = field(default_factory=list)
+    segments: list[QuoteSegment] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Quote":
+        segments_raw = data.get("segments") or []
+        if segments_raw:
+            segments = [QuoteSegment.from_dict(item) for item in segments_raw]
+        else:
+            segments = []
+            text = str(data.get("text") or "")
+            if text:
+                segments.append(QuoteSegment(type="text", text=text))
+            for image_id in [str(x) for x in (data.get("image_ids") or []) if str(x)]:
+                segments.append(QuoteSegment(type="image", asset_id=image_id))
+
+        image_ids = [segment.asset_id for segment in segments if segment.type == "image" and segment.asset_id]
+        if not image_ids:
+            image_ids = [str(x) for x in (data.get("image_ids") or []) if str(x)]
         return cls(
             id=str(data.get("id") or ""),
             qq=str(data.get("qq") or ""),
@@ -25,11 +58,25 @@ class Quote:
             created_by=str(data.get("created_by") or ""),
             created_at=float(data.get("created_at") or 0),
             group=str(data.get("group") or ""),
-            image_ids=[str(x) for x in (data.get("image_ids") or []) if str(x)],
+            image_ids=image_ids,
+            segments=segments,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        image_ids = [segment.asset_id for segment in self.segments if segment.type == "image" and segment.asset_id]
+        if image_ids:
+            self.image_ids = image_ids
+        return {
+            "id": self.id,
+            "qq": self.qq,
+            "name": self.name,
+            "text": self.text,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "group": self.group,
+            "image_ids": self.image_ids,
+            "segments": [segment.to_dict() for segment in self.segments],
+        }
 
 
 @dataclass(slots=True)
@@ -96,3 +143,11 @@ class CommandResponse:
     path: str = ""
     url: str = ""
     quote_id: str = ""
+    chain: list[Any] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PendingQuoteSegment:
+    type: str
+    text: str = ""
+    image: PreparedImage | None = None
