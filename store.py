@@ -224,6 +224,9 @@ class QuoteRepository:
                 return asset
         return None
 
+    def list_quotes(self, session_key: str) -> list[Quote]:
+        return self.get_store(session_key).load_quotes()
+
     def get_quote(self, session_key: str, quote_id: str) -> Quote | None:
         for quote in self.get_store(session_key).load_quotes():
             if quote.id == quote_id:

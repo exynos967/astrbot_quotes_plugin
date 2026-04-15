@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover
     Comp = None  # type: ignore
 
 try:
-    from .constants import DUPLICATE_IMAGE_MESSAGE
+    from .constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
     from .models import CommandResponse, ForwardNode, ForwardSegment, Quote
     from .napcat_service import NapcatService
     from .renderer import QuoteRenderer
@@ -27,7 +27,7 @@ try:
         sha256_bytes,
     )
 except ImportError:  # pragma: no cover
-    from constants import DUPLICATE_IMAGE_MESSAGE
+    from constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
     from models import CommandResponse, ForwardNode, ForwardSegment, Quote
     from napcat_service import NapcatService
     from renderer import QuoteRenderer
@@ -118,6 +118,14 @@ class QuoteService:
 
         from time import time
 
+        duplicate_fingerprint = self._fingerprint_pending_standard_segments(all_segments)
+        if target_qq and duplicate_fingerprint and self._has_duplicate_quote(
+            session_key,
+            target_qq=target_qq,
+            fingerprint=duplicate_fingerprint,
+        ):
+            return CommandResponse(kind="plain", text=DUPLICATE_QUOTE_MESSAGE)
+
         quote = Quote(
             id=random_id("q_"),
             qq=str(target_qq or ""),
@@ -173,6 +181,14 @@ class QuoteService:
             target_name = target_qq or "未知用户"
 
         from time import time
+
+        duplicate_fingerprint = self._fingerprint_pending_forward_nodes(nodes)
+        if target_qq and duplicate_fingerprint and self._has_duplicate_quote(
+            session_key,
+            target_qq=target_qq,
+            fingerprint=duplicate_fingerprint,
+        ):
+            return CommandResponse(kind="plain", text=DUPLICATE_QUOTE_MESSAGE)
 
         quote = Quote(
             id=random_id("q_"),
@@ -583,6 +599,13 @@ class QuoteService:
             return ""
         return self._hash_payload({"kind": "chain", "parts": parts})
 
+    def _fingerprint_pending_standard_segments(self, segments: list[Any]) -> str:
+        parts = [self._pending_segment_payload(segment) for segment in segments]
+        parts = [item for item in parts if item is not None]
+        if not parts:
+            return ""
+        return self._hash_payload({"kind": "chain", "parts": parts})
+
     async def _fingerprint_standard_chain(self, chain: list[Any]) -> str:
         parts: list[dict[str, Any]] = []
         for component in chain:
@@ -816,6 +839,22 @@ class QuoteService:
     def _hash_payload(self, payload: dict[str, Any]) -> str:
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return sha256_bytes(canonical.encode("utf-8"))
+
+    def _has_duplicate_quote(self, session_key: str, *, target_qq: str, fingerprint: str) -> bool:
+        if not target_qq or not fingerprint:
+            return False
+        for quote in self.repository.list_quotes(session_key):
+            if str(quote.qq or "") != str(target_qq):
+                continue
+            existing_fingerprint = self._stored_quote_fingerprint(quote)
+            if existing_fingerprint and existing_fingerprint == fingerprint:
+                return True
+        return False
+
+    def _stored_quote_fingerprint(self, quote: Quote) -> str:
+        if quote.kind == "forward":
+            return self._fingerprint_forward_nodes(quote.group, quote.forward_nodes)
+        return self._fingerprint_standard_quote(quote)
 
     def _self_id_of_event(self, event: Any) -> str:
         for getter in (
