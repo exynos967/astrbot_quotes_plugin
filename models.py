@@ -4,6 +4,32 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+def _is_legacy_image_placeholder_text(text: str) -> bool:
+    normalized = "".join(str(text or "").strip().lower().split())
+    return normalized in {
+        "[图片]",
+        "【图片】",
+        "[image]",
+        "【image】",
+        "[img]",
+        "【img】",
+    }
+
+
+def _filter_legacy_image_placeholder_segments(segments: list["QuoteSegment"]) -> list["QuoteSegment"]:
+    has_image = any(segment.type == "image" and segment.asset_id for segment in segments)
+    if not has_image:
+        return segments
+    return [
+        segment
+        for segment in segments
+        if not (
+            segment.type == "text"
+            and _is_legacy_image_placeholder_text(segment.text)
+        )
+    ]
+
+
 @dataclass(slots=True)
 class QuoteSegment:
     type: str
@@ -121,17 +147,23 @@ class Quote:
         kind = str(data.get("kind") or "")
         forward_nodes_raw = data.get("forward_nodes") or []
         forward_nodes = [ForwardNode.from_dict(item) for item in forward_nodes_raw]
+        raw_text = str(data.get("text") or "")
+        raw_image_ids = [str(x) for x in (data.get("image_ids") or []) if str(x)]
 
         segments_raw = data.get("segments") or []
         if segments_raw:
             segments = [QuoteSegment.from_dict(item) for item in segments_raw]
         else:
             segments = []
-            text = str(data.get("text") or "")
-            if text:
-                segments.append(QuoteSegment(type="text", text=text))
-            for image_id in [str(x) for x in (data.get("image_ids") or []) if str(x)]:
+            if raw_text and not (raw_image_ids and _is_legacy_image_placeholder_text(raw_text)):
+                segments.append(QuoteSegment(type="text", text=raw_text))
+            for image_id in raw_image_ids:
                 segments.append(QuoteSegment(type="image", asset_id=image_id))
+
+        segments = _filter_legacy_image_placeholder_segments(segments)
+        has_image_segment = any(segment.type == "image" and segment.asset_id for segment in segments)
+        if (raw_image_ids or has_image_segment) and _is_legacy_image_placeholder_text(raw_text):
+            raw_text = ""
 
         if not kind:
             kind = "forward" if forward_nodes else "standard"
@@ -150,7 +182,7 @@ class Quote:
             id=str(data.get("id") or ""),
             qq=str(data.get("qq") or ""),
             name=str(data.get("name") or ""),
-            text=str(data.get("text") or ""),
+            text=raw_text,
             created_by=str(data.get("created_by") or ""),
             created_at=float(data.get("created_at") or 0),
             group=str(data.get("group") or ""),
