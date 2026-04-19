@@ -234,7 +234,7 @@ class QuoteService:
                 delete_fingerprint=await self.build_delete_fingerprint(quote, chain=chain),
             )
 
-        if self.text_mode or quote.kind == "forward":
+        if self.text_mode or quote.kind == "forward" or self.renderer.should_fallback_to_plain(quote):
             text = self._quote_plain_fallback(quote)
             return CommandResponse(
                 kind="plain",
