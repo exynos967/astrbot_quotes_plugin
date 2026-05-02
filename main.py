@@ -177,6 +177,7 @@ class QuotesPlugin(Star):
                     quote_id=quote_id,
                     fingerprint=fingerprint,
                     sent_at=time(),
+                    image_signatures=event.get_extra("_quotes_sent_image_signatures", default=[]),
                 )
         except Exception as exc:
             logger.info(f"after_message_sent 记录失败: {exc}")
@@ -187,6 +188,7 @@ class QuotesPlugin(Star):
         if response.quote_id and response.delete_fingerprint:
             event.set_extra("_quotes_sent_quote_id", response.quote_id)
             event.set_extra("_quotes_sent_fingerprint", response.delete_fingerprint)
+            event.set_extra("_quotes_sent_image_signatures", response.delete_image_signatures)
         if response.kind == "plain":
             yield event.plain_result(response.text)
             return

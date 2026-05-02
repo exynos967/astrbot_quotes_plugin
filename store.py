@@ -39,6 +39,7 @@ try:
         PreparedImage,
         PreparedMedia,
         Quote,
+        ImageSignature,
         SentQuoteRecord,
         QuoteSegment,
     )
@@ -76,6 +77,7 @@ except ImportError:  # pragma: no cover
         PreparedImage,
         PreparedMedia,
         Quote,
+        ImageSignature,
         SentQuoteRecord,
         QuoteSegment,
     )
@@ -240,6 +242,7 @@ class QuoteRepository:
         quote_id: str,
         fingerprint: str,
         sent_at: float,
+        image_signatures: list[ImageSignature] | None = None,
     ) -> None:
         if not quote_id or not fingerprint:
             return
@@ -255,6 +258,7 @@ class QuoteRepository:
                     quote_id=quote_id,
                     fingerprint=fingerprint,
                     sent_at=sent_at,
+                    image_signatures=image_signatures or [],
                 )
             )
             records = sorted(records, key=lambda item: item.sent_at)
@@ -273,6 +277,39 @@ class QuoteRepository:
             return None
         records = self.get_store(session_key).load_sent_records()
         matches = [item for item in records if item.fingerprint == fingerprint and item.quote_id]
+        if not matches:
+            return None
+        if replied_at > 0:
+            bounded = [item for item in matches if item.sent_at <= replied_at]
+            if bounded:
+                matches = bounded
+        matches.sort(key=lambda item: item.sent_at, reverse=True)
+        return matches[0].quote_id if matches else None
+
+    def find_sent_quote_id_by_image_signature(
+        self,
+        session_key: str,
+        *,
+        image: PreparedImage,
+        replied_at: float = 0.0,
+    ) -> str | None:
+        if image is None:
+            return None
+        records = self.get_store(session_key).load_sent_records()
+        matches: list[SentQuoteRecord] = []
+        for record in records:
+            if not record.quote_id or len(record.image_signatures) != 1:
+                continue
+            signature = record.image_signatures[0]
+            if is_near_duplicate(
+                image,
+                signature.sha256,
+                signature.dhash,
+                signature.width,
+                signature.height,
+            ):
+                matches.append(record)
+
         if not matches:
             return None
         if replied_at > 0:

@@ -318,7 +318,28 @@ class CommandResponse:
     url: str = ""
     quote_id: str = ""
     delete_fingerprint: str = ""
+    delete_image_signatures: list["ImageSignature"] = field(default_factory=list)
     chain: list[Any] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ImageSignature:
+    sha256: str
+    dhash: str = ""
+    width: int = 0
+    height: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ImageSignature":
+        return cls(
+            sha256=str(data.get("sha256") or ""),
+            dhash=str(data.get("dhash") or ""),
+            width=int(data.get("width") or 0),
+            height=int(data.get("height") or 0),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -326,6 +347,7 @@ class SentQuoteRecord:
     quote_id: str
     fingerprint: str
     sent_at: float = 0.0
+    image_signatures: list[ImageSignature] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SentQuoteRecord":
@@ -333,6 +355,11 @@ class SentQuoteRecord:
             quote_id=str(data.get("quote_id") or ""),
             fingerprint=str(data.get("fingerprint") or ""),
             sent_at=float(data.get("sent_at") or 0),
+            image_signatures=[
+                ImageSignature.from_dict(item)
+                for item in (data.get("image_signatures") or [])
+                if isinstance(item, dict)
+            ],
         )
 
     def to_dict(self) -> dict[str, Any]:

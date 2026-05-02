@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover
 
 try:
     from .constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
-    from .models import CommandResponse, ForwardNode, ForwardSegment, Quote
+    from .models import CommandResponse, ForwardNode, ForwardSegment, ImageSignature, Quote
     from .napcat_service import NapcatService
     from .renderer import QuoteRenderer
     from .store import QuoteRepository
@@ -28,7 +28,7 @@ try:
     )
 except ImportError:  # pragma: no cover
     from constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
-    from models import CommandResponse, ForwardNode, ForwardSegment, Quote
+    from models import CommandResponse, ForwardNode, ForwardSegment, ImageSignature, Quote
     from napcat_service import NapcatService
     from renderer import QuoteRenderer
     from store import QuoteRepository
@@ -232,6 +232,7 @@ class QuoteService:
                 chain=chain,
                 quote_id=quote.id,
                 delete_fingerprint=await self.build_delete_fingerprint(quote, chain=chain),
+                delete_image_signatures=self.build_delete_image_signatures(quote),
             )
 
         if self.text_mode or quote.kind == "forward" or self.renderer.should_fallback_to_plain(quote):
@@ -293,16 +294,32 @@ class QuoteService:
         if self_id and sender_id and sender_id != self_id:
             return None
 
-        fingerprint = await self._fingerprint_from_reply_payload(event, reply_payload)
+        fingerprint, image = await self._fingerprint_from_reply_payload(event, reply_payload)
         if not fingerprint:
             return None
 
         replied_at = float(reply_payload.get("time") or 0)
-        return self.repository.find_sent_quote_id(
+        quote_id = self.repository.find_sent_quote_id(
             session_key,
             fingerprint=fingerprint,
             replied_at=replied_at,
         )
+        if quote_id:
+            return quote_id
+        if image is not None:
+            legacy_quote_id = self.repository.find_sent_quote_id(
+                session_key,
+                fingerprint=self._fingerprint_image_chain_sha(image.sha256),
+                replied_at=replied_at,
+            )
+            if legacy_quote_id:
+                return legacy_quote_id
+            return self.repository.find_sent_quote_id_by_image_signature(
+                session_key,
+                image=image,
+                replied_at=replied_at,
+            )
+        return None
 
     def build_quote_chain(self, quote: Quote) -> list[Any]:
         if Comp is None:
@@ -544,6 +561,10 @@ class QuoteService:
         if quote.kind == "forward":
             return self._fingerprint_forward_nodes(quote.group, quote.forward_nodes)
 
+        single_image = self._single_standard_image_signature(quote)
+        if single_image is not None:
+            return self._fingerprint_image_sha(single_image.sha256)
+
         if chain:
             fingerprint = await self._fingerprint_standard_chain(chain)
             if fingerprint:
@@ -551,7 +572,15 @@ class QuoteService:
 
         return self._fingerprint_standard_quote(quote)
 
-    async def _fingerprint_from_reply_payload(self, event: Any, reply_payload: dict[str, Any]) -> str:
+    def build_delete_image_signatures(self, quote: Quote) -> list[ImageSignature]:
+        signature = self._single_standard_image_signature(quote)
+        return [signature] if signature is not None else []
+
+    async def _fingerprint_from_reply_payload(
+        self,
+        event: Any,
+        reply_payload: dict[str, Any],
+    ) -> tuple[str, Any | None]:
         message = reply_payload.get("message")
         forward_id, forward_payload = self.napcat_service.extract_forward_reference(message)
         if forward_id or forward_payload:
@@ -562,24 +591,27 @@ class QuoteService:
                 forward_loader=self.napcat_service.fetch_forward_messages,
             )
             if nodes:
-                return self._fingerprint_pending_forward_nodes(nodes)
+                return self._fingerprint_pending_forward_nodes(nodes), None
 
         segments = await self.image_service.build_reply_segments(event, message)
         normalized = self._normalize_pending_segments(segments)
         if not normalized:
-            return ""
+            return "", None
 
         if len(normalized) == 1 and normalized[0].type == "image" and normalized[0].image is not None:
-            return self._fingerprint_image_sha(normalized[0].image.sha256)
+            return self._fingerprint_image_sha(normalized[0].image.sha256), normalized[0].image
 
-        return self._hash_payload(
-            {
-                "kind": "chain",
-                "parts": [
-                    self._pending_segment_payload(segment)
-                    for segment in normalized
-                ],
-            }
+        return (
+            self._hash_payload(
+                {
+                    "kind": "chain",
+                    "parts": [
+                        self._pending_segment_payload(segment)
+                        for segment in normalized
+                    ],
+                }
+            ),
+            None,
         )
 
     def _fingerprint_plain_text(self, text: str) -> str:
@@ -735,6 +767,30 @@ class QuoteService:
 
     def _fingerprint_image_sha(self, sha_value: str) -> str:
         return self._hash_payload({"kind": "image", "sha256": str(sha_value or "")})
+
+    def _fingerprint_image_chain_sha(self, sha_value: str) -> str:
+        return self._hash_payload(
+            {
+                "kind": "chain",
+                "parts": [{"type": "image", "sha256": str(sha_value or "")}],
+            }
+        )
+
+    def _single_standard_image_signature(self, quote: Quote) -> ImageSignature | None:
+        if quote.kind != "standard" or len(quote.segments) != 1:
+            return None
+        segment = quote.segments[0]
+        if segment.type != "image" or not segment.asset_id:
+            return None
+        asset = self.repository.find_asset(quote.group, segment.asset_id)
+        if asset is None or not asset.sha256:
+            return None
+        return ImageSignature(
+            sha256=asset.sha256,
+            dhash=asset.dhash,
+            width=asset.width,
+            height=asset.height,
+        )
 
     def _stored_standard_segment_payload(self, session_key: str, segment: Any) -> dict[str, Any] | None:
         if segment.type == "text":
