@@ -297,9 +297,11 @@ class QuoteRepository:
             return None
         records = self.get_store(session_key).load_sent_records()
         matches: list[SentQuoteRecord] = []
+        candidate_count = 0
         for record in records:
             if not record.quote_id or len(record.image_signatures) != 1:
                 continue
+            candidate_count += 1
             signature = record.image_signatures[0]
             if is_near_duplicate(
                 image,
@@ -311,12 +313,20 @@ class QuoteRepository:
                 matches.append(record)
 
         if not matches:
+            logger.info(
+                "删除语录近似图片匹配失败: "
+                f"session={session_key}, candidates={candidate_count}, sha256={image.sha256[:12]}, dhash={image.dhash[:12]}"
+            )
             return None
         if replied_at > 0:
             bounded = [item for item in matches if item.sent_at <= replied_at]
             if bounded:
                 matches = bounded
         matches.sort(key=lambda item: item.sent_at, reverse=True)
+        logger.info(
+            "删除语录近似图片匹配命中: "
+            f"session={session_key}, matches={len(matches)}, quote_id={matches[0].quote_id}"
+        )
         return matches[0].quote_id if matches else None
 
     async def create_quote_with_segments(
@@ -331,6 +341,7 @@ class QuoteRepository:
             assets = store.load_assets()
             images = [segment.image for segment in segments if segment.type == "image" and segment.image is not None]
             if self._has_duplicate(images, assets):
+                logger.info(f"存储语录失败: 图片重复, session={session_key}, quote_id={quote.id}, images={len(images)}")
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
             from time import time
@@ -392,6 +403,7 @@ class QuoteRepository:
             media_assets = store.load_media_assets()
             images = self._collect_pending_forward_images(nodes)
             if self._has_duplicate(images, image_assets):
+                logger.info(f"存储聊天记录语录失败: 图片重复, session={session_key}, quote_id={quote.id}, images={len(images)}")
                 return CreateQuoteResult(duplicate=True, message=DUPLICATE_IMAGE_MESSAGE)
 
             from time import time

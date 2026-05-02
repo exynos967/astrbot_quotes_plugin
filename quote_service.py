@@ -96,6 +96,7 @@ class QuoteService:
         )
         all_segments = self._normalize_pending_segments([*reply_segments, *current_segments])
         if not all_segments:
+            logger.info(f"上传语录失败: 未获取到可收录内容, session={session_key}, sender={event.get_sender_id()}")
             return CommandResponse(kind="plain", text="未获取到被回复消息内容或图片，请确认已正确回复对方的消息或附带图片。")
 
         if explicit_qq:
@@ -110,6 +111,7 @@ class QuoteService:
             target_qq = ""
 
         if target_qq and target_qq in self.blacklist:
+            logger.info(f"上传语录已忽略: 目标用户在黑名单中, session={session_key}, target_qq={target_qq}")
             return CommandResponse(kind="plain", text="该用户在语录黑名单中，本次语录已忽略。")
 
         target_name = await self.napcat_service.resolve_user_name(event, target_qq) if target_qq else ""
@@ -124,6 +126,7 @@ class QuoteService:
             target_qq=target_qq,
             fingerprint=duplicate_fingerprint,
         ):
+            logger.info(f"上传语录被拒绝: 内容重复, session={session_key}, target_qq={target_qq}")
             return CommandResponse(kind="plain", text=DUPLICATE_QUOTE_MESSAGE)
 
         quote = Quote(
@@ -137,9 +140,15 @@ class QuoteService:
         )
         result = await self.repository.create_quote_with_segments(session_key, quote, all_segments)
         if result.duplicate:
+            logger.info(f"上传语录被拒绝: 图片重复, session={session_key}, target_qq={target_qq}")
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
 
         image_count = len([segment for segment in all_segments if segment.type == "image"])
+        logger.info(
+            "上传语录成功: "
+            f"quote_id={quote.id}, session={session_key}, target_qq={target_qq}, "
+            f"segments={len(all_segments)}, images={image_count}"
+        )
         if image_count:
             return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。")
         return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录：{quote.text}")
@@ -162,6 +171,7 @@ class QuoteService:
             forward_loader=self.napcat_service.fetch_forward_messages,
         )
         if not nodes:
+            logger.info(f"上传聊天记录语录失败: 未获取到 forward 节点, session={session_key}, sender={event.get_sender_id()}")
             return CommandResponse(kind="plain", text="未获取到可用的聊天记录内容，请确认回复的是 QQ 合并转发消息。")
 
         if explicit_qq:
@@ -174,6 +184,7 @@ class QuoteService:
             target_qq = str(event.get_sender_id())
 
         if target_qq and target_qq in self.blacklist:
+            logger.info(f"上传聊天记录语录已忽略: 目标用户在黑名单中, session={session_key}, target_qq={target_qq}")
             return CommandResponse(kind="plain", text="该用户在语录黑名单中，本次语录已忽略。")
 
         target_name = await self.napcat_service.resolve_user_name(event, target_qq) if target_qq else ""
@@ -188,6 +199,7 @@ class QuoteService:
             target_qq=target_qq,
             fingerprint=duplicate_fingerprint,
         ):
+            logger.info(f"上传聊天记录语录被拒绝: 内容重复, session={session_key}, target_qq={target_qq}")
             return CommandResponse(kind="plain", text=DUPLICATE_QUOTE_MESSAGE)
 
         quote = Quote(
@@ -202,9 +214,14 @@ class QuoteService:
         )
         result = await self.repository.create_quote_with_forward_nodes(session_key, quote, nodes)
         if result.duplicate:
+            logger.info(f"上传聊天记录语录被拒绝: 图片重复, session={session_key}, target_qq={target_qq}")
             return CommandResponse(kind="plain", text=result.message or DUPLICATE_IMAGE_MESSAGE)
 
         message_count = self._count_forward_messages(nodes)
+        logger.info(
+            "上传聊天记录语录成功: "
+            f"quote_id={quote.id}, session={session_key}, target_qq={target_qq}, messages={message_count}"
+        )
         return CommandResponse(
             kind="plain",
             text=f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。",
@@ -217,6 +234,11 @@ class QuoteService:
         only_qq = explicit_qq or (self.extract_at_qq(event) or "")
         quote = await self.repository.random_quote(target_session, qq=only_qq or None)
         if quote is None:
+            if not silent_if_empty:
+                logger.info(
+                    "随机语录未命中: "
+                    f"session={target_session or 'global'}, target_qq={only_qq or '*'}"
+                )
             if silent_if_empty:
                 return None
             if only_qq:
@@ -225,6 +247,7 @@ class QuoteService:
                 text = "还没有语录，先用 上传 保存一条吧~" if self.global_mode else "本会话还没有语录，先用 上传 保存一条吧~"
             return CommandResponse(kind="plain", text=text)
 
+        logger.info(f"随机语录命中: quote_id={quote.id}, session={quote.group}, target_qq={only_qq or '*'}")
         chain = self.build_quote_chain(quote)
         if chain:
             return CommandResponse(
@@ -282,20 +305,27 @@ class QuoteService:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
         reply_message_id = self.get_reply_message_id(event)
         if not reply_message_id:
+            logger.info("删除语录定位失败: 当前消息没有 Reply 段。")
             return None
 
         reply_payload = await self.napcat_service.fetch_onebot_message(event, reply_message_id)
         if not reply_payload:
+            logger.info(f"删除语录定位失败: get_msg 未返回被回复消息, message_id={reply_message_id}")
             return None
 
         sender = reply_payload.get("sender") or {}
         sender_id = str(sender.get("user_id") or sender.get("qq") or "")
         self_id = self._self_id_of_event(event)
         if self_id and sender_id and sender_id != self_id:
+            logger.info(
+                "删除语录定位失败: 被回复消息不是机器人发送。"
+                f" sender_id={sender_id}, self_id={self_id}, message_id={reply_message_id}"
+            )
             return None
 
         fingerprint, image = await self._fingerprint_from_reply_payload(event, reply_payload)
         if not fingerprint:
+            logger.info(f"删除语录定位失败: 无法从被回复消息计算指纹, message_id={reply_message_id}")
             return None
 
         replied_at = float(reply_payload.get("time") or 0)
@@ -305,6 +335,7 @@ class QuoteService:
             replied_at=replied_at,
         )
         if quote_id:
+            logger.info(f"删除语录定位成功: 精确指纹匹配 quote_id={quote_id}, session={session_key}")
             return quote_id
         if image is not None:
             legacy_quote_id = self.repository.find_sent_quote_id(
@@ -313,12 +344,28 @@ class QuoteService:
                 replied_at=replied_at,
             )
             if legacy_quote_id:
+                logger.info(
+                    "删除语录定位成功: 兼容旧版纯图片链式指纹匹配 "
+                    f"quote_id={legacy_quote_id}, session={session_key}"
+                )
                 return legacy_quote_id
-            return self.repository.find_sent_quote_id_by_image_signature(
+            near_quote_id = self.repository.find_sent_quote_id_by_image_signature(
                 session_key,
                 image=image,
                 replied_at=replied_at,
             )
+            if near_quote_id:
+                logger.info(
+                    "删除语录定位成功: 纯图片感知哈希近似匹配 "
+                    f"quote_id={near_quote_id}, session={session_key}"
+                )
+                return near_quote_id
+            logger.info(
+                "删除语录定位失败: 单图消息未匹配 sent_index。"
+                f" session={session_key}, sha256={image.sha256[:12]}, dhash={image.dhash[:12]}"
+            )
+            return None
+        logger.info(f"删除语录定位失败: 指纹未匹配 sent_index, session={session_key}")
         return None
 
     def build_quote_chain(self, quote: Quote) -> list[Any]:
@@ -563,6 +610,7 @@ class QuoteService:
 
         single_image = self._single_standard_image_signature(quote)
         if single_image is not None:
+            logger.info(f"语录删除指纹: 使用纯图片指纹 quote_id={quote.id}, sha256={single_image.sha256[:12]}")
             return self._fingerprint_image_sha(single_image.sha256)
 
         if chain:

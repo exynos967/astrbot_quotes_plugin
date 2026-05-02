@@ -179,6 +179,7 @@ class QuotesPlugin(Star):
                     sent_at=time(),
                     image_signatures=event.get_extra("_quotes_sent_image_signatures", default=[]),
                 )
+                logger.info(f"已记录语录发送索引: quote_id={quote_id}, session={self._session_key(event)}")
         except Exception as exc:
             logger.info(f"after_message_sent 记录失败: {exc}")
 
