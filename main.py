@@ -138,17 +138,7 @@ class QuotesPlugin(Star):
         except Exception:
             return
 
-        has_poke_to_bot = False
-        for segment in segments:
-            try:
-                if isinstance(segment, Comp.Poke):
-                    target = self._extract_poke_target(segment)
-                    if target and str(target) == str(self_id):
-                        has_poke_to_bot = True
-                        break
-            except Exception:
-                continue
-        if not has_poke_to_bot:
+        if not self._is_poke_to_bot(event, segments, self_id):
             return
 
         import secrets
@@ -263,6 +253,7 @@ class QuotesPlugin(Star):
     def _get_self_id(self, event: AstrMessageEvent) -> str:
         for getter in (
             lambda: getattr(getattr(event, "message_obj", None), "self_id", None),
+            lambda: event.get_self_id() if hasattr(event, "get_self_id") else None,
             lambda: getattr(event, "self_id", None),
             lambda: (getattr(event, "raw_event", None) or {}).get("self_id") if isinstance(getattr(event, "raw_event", None), dict) else None,
         ):
@@ -274,6 +265,27 @@ class QuotesPlugin(Star):
                 return str(value)
         return ""
 
+    def _is_poke_to_bot(self, event: AstrMessageEvent, segments: list[Any], self_id: str) -> bool:
+        has_unknown_target_poke = False
+        for segment in segments:
+            try:
+                if not isinstance(segment, Comp.Poke):
+                    continue
+                target = self._extract_poke_target(segment)
+                if self._is_same_id(target, self_id):
+                    return True
+                if not self._looks_like_user_id(target):
+                    has_unknown_target_poke = True
+            except Exception:
+                continue
+
+        has_raw_poke, raw_targets = self._extract_raw_poke_targets(event, self_id)
+        if any(self._is_same_id(target, self_id) for target in raw_targets):
+            return True
+        if has_raw_poke and not raw_targets:
+            return True
+        return has_unknown_target_poke
+
     def _extract_poke_target(self, segment: Any) -> str | None:
         for field in ("qq", "target", "target_id", "user_id", "uin", "id"):
             try:
@@ -283,6 +295,74 @@ class QuotesPlugin(Star):
             if value:
                 return str(value)
         return None
+
+    def _extract_raw_poke_targets(self, event: AstrMessageEvent, self_id: str) -> tuple[bool, list[str]]:
+        raw_event = self._get_raw_event(event)
+        if raw_event is None:
+            return False, []
+
+        has_poke = False
+        targets: list[str] = []
+        if str(self._read_raw_value(raw_event, "sub_type") or "").lower() == "poke":
+            has_poke = True
+            self._append_target(targets, self._read_raw_value(raw_event, "target_id"))
+            self._append_target(targets, self._read_raw_value(raw_event, "target"))
+            self._append_target(targets, self._read_raw_value(raw_event, "qq"))
+
+        raw_message = self._read_raw_value(raw_event, "message")
+        if isinstance(raw_message, list):
+            for segment in raw_message:
+                if str(self._read_raw_value(segment, "type") or "").lower() != "poke":
+                    continue
+                has_poke = True
+                data = self._read_raw_value(segment, "data") or {}
+                for field in ("qq", "target", "target_id", "user_id", "uin"):
+                    self._append_target(targets, self._read_raw_value(data, field))
+                segment_id = self._read_raw_value(data, "id")
+                if self._is_same_id(segment_id, self_id):
+                    self._append_target(targets, segment_id)
+
+        return has_poke, targets
+
+    def _get_raw_event(self, event: AstrMessageEvent) -> Any:
+        for value in (
+            getattr(event, "raw_event", None),
+            getattr(getattr(event, "message_obj", None), "raw_message", None),
+        ):
+            if value is not None:
+                return value
+        return None
+
+    def _read_raw_value(self, data: Any, field: str) -> Any:
+        if isinstance(data, dict):
+            return data.get(field)
+        getter = getattr(data, "get", None)
+        if callable(getter):
+            try:
+                return getter(field)
+            except Exception:
+                pass
+        try:
+            return getattr(data, field, None)
+        except Exception:
+            return None
+
+    def _append_target(self, targets: list[str], value: Any) -> None:
+        if self._looks_like_user_id(value):
+            text = str(value).strip()
+            if text not in targets:
+                targets.append(text)
+
+    def _is_same_id(self, value: Any, expected: str) -> bool:
+        return bool(value is not None and str(value).strip() == str(expected).strip())
+
+    def _looks_like_user_id(self, value: Any) -> bool:
+        if value is None:
+            return False
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null", "undefined"} or text == "0":
+            return False
+        return not text.isdigit() or len(text) >= 5
 
     async def _check_delete_permission(self, event: AstrMessageEvent) -> bool:
         level = str(self.config.get("delete_permission") or "管理员").strip().replace(" ", "")
