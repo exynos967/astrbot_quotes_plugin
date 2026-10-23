@@ -295,7 +295,9 @@ class QuoteRepository:
     ) -> str | None:
         if image is None:
             return None
-        records = self.get_store(session_key).load_sent_records()
+        store = self.get_store(session_key)
+        records = store.load_sent_records()
+        assets_by_sha = {item.sha256: item for item in store.load_assets() if item.sha256}
         matches: list[SentQuoteRecord] = []
         candidate_count = 0
         for record in records:
@@ -309,6 +311,7 @@ class QuoteRepository:
                 signature.dhash,
                 signature.width,
                 signature.height,
+                right_content_loader=lambda sha=signature.sha256: self._read_asset_bytes(assets_by_sha.get(sha)),
             ):
                 matches.append(record)
 
@@ -350,6 +353,7 @@ class QuoteRepository:
             created_files: list[Path] = []
             try:
                 persisted_segments: list[QuoteSegment] = []
+                image_ids: list[str] = []
                 for segment in segments:
                     if segment.type == "text":
                         text = str(segment.text or "").strip()
@@ -366,14 +370,15 @@ class QuoteRepository:
                         image,
                         created_at=time(),
                         created_files=created_files,
+                        created_image_assets=created_assets,
                     )
-                    created_assets.append(asset)
+                    image_ids.append(asset.asset_id)
                     persisted_segments.append(QuoteSegment(type="image", asset_id=asset.asset_id))
 
                 quote.kind = "standard"
                 quote.forward_nodes = []
                 quote.segments = persisted_segments
-                quote.image_ids = [item.asset_id for item in created_assets]
+                quote.image_ids = image_ids
                 quote.media_ids = []
                 if not quote.text:
                     quote.text = " ".join(
@@ -642,8 +647,8 @@ class QuoteRepository:
                         segment.image,
                         created_at=created_at,
                         created_files=created_files,
+                        created_image_assets=created_image_assets,
                     )
-                    created_image_assets.append(asset)
                     image_ids.append(asset.asset_id)
                     persisted_segments.append(ForwardSegment(type="image", asset_id=asset.asset_id))
                     continue
@@ -718,12 +723,26 @@ class QuoteRepository:
         *,
         created_at: float,
         created_files: list[Path],
+        created_image_assets: list[ImageAsset] | None = None,
     ) -> ImageAsset:
+        if created_image_assets is not None:
+            for existing in created_image_assets:
+                if is_near_duplicate(
+                    image,
+                    existing.sha256,
+                    existing.dhash,
+                    existing.width,
+                    existing.height,
+                    right_content_loader=lambda item=existing: self._read_asset_bytes(item),
+                ):
+                    existing.ref_count += 1
+                    return existing
+
         file_name = f"{random_id()}{image.extension}"
         abs_path = store.image_abs_path(file_name)
         abs_path.write_bytes(image.content)
         created_files.append(abs_path)
-        return ImageAsset(
+        asset = ImageAsset(
             asset_id=random_id("img_"),
             file_name=file_name,
             rel_path=rel_image_path(store.session_key, file_name),
@@ -734,6 +753,9 @@ class QuoteRepository:
             ref_count=1,
             created_at=created_at,
         )
+        if created_image_assets is not None:
+            created_image_assets.append(asset)
+        return asset
 
     def _persist_media_asset(
         self,
@@ -783,21 +805,22 @@ class QuoteRepository:
                 lines.append(f"{node.sender_name or node.sender_uin or '未知用户'}：{content}")
         return "\n".join(lines).strip()
 
+    def _read_asset_bytes(self, asset: ImageAsset | None) -> bytes | None:
+        if asset is None or not asset.rel_path:
+            return None
+        try:
+            path = self.root / asset.rel_path
+            if path.exists():
+                return path.read_bytes()
+        except Exception as exc:
+            logger.info(f"读取本地图片资源失败 {asset.rel_path}: {exc}")
+        return None
+
     def _has_duplicate(self, images: list[PreparedImage], existing_assets: list[ImageAsset]) -> bool:
-        if not images:
+        if not images or not existing_assets:
             return False
 
-        for index, current in enumerate(images):
-            for previous in images[:index]:
-                if is_near_duplicate(
-                    current,
-                    previous.sha256,
-                    previous.dhash,
-                    previous.width,
-                    previous.height,
-                ):
-                    return True
-
+        for current in images:
             for asset in existing_assets:
                 if is_near_duplicate(
                     current,
@@ -805,6 +828,7 @@ class QuoteRepository:
                     asset.dhash,
                     asset.width,
                     asset.height,
+                    right_content_loader=lambda item=asset: self._read_asset_bytes(item),
                 ):
                     return True
         return False

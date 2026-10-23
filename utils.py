@@ -5,9 +5,9 @@ import json
 import re
 import secrets
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 try:
     from astrbot.api import logger
@@ -24,8 +24,16 @@ except Exception:  # pragma: no cover
 try:
     from .constants import (
         DEFAULT_ASPECT_RATIO_TOLERANCE,
+        DEFAULT_COLOR_HASH_SIZE,
+        DEFAULT_COLOR_HASH_THRESHOLD,
         DEFAULT_DHASH_SIZE,
         DEFAULT_DHASH_THRESHOLD,
+        DEFAULT_EXTENDED_DHASH_SIZE,
+        DEFAULT_EXTENDED_DHASH_THRESHOLD,
+        DEFAULT_PIXEL_MAX_BLOCK_DIFF_THRESHOLD,
+        DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
+        DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
+        DEFAULT_ROW_DHASH_THRESHOLD,
         GROUPS_DIRNAME,
         MEDIA_DIRNAME,
         PLUGIN_NAME,
@@ -34,8 +42,16 @@ try:
 except ImportError:  # pragma: no cover
     from constants import (
         DEFAULT_ASPECT_RATIO_TOLERANCE,
+        DEFAULT_COLOR_HASH_SIZE,
+        DEFAULT_COLOR_HASH_THRESHOLD,
         DEFAULT_DHASH_SIZE,
         DEFAULT_DHASH_THRESHOLD,
+        DEFAULT_EXTENDED_DHASH_SIZE,
+        DEFAULT_EXTENDED_DHASH_THRESHOLD,
+        DEFAULT_PIXEL_MAX_BLOCK_DIFF_THRESHOLD,
+        DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
+        DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
+        DEFAULT_ROW_DHASH_THRESHOLD,
         GROUPS_DIRNAME,
         MEDIA_DIRNAME,
         PLUGIN_NAME,
@@ -192,29 +208,72 @@ def guess_media_extension(source_name: str = "", content_type: str = "", media_t
     return default_map.get(str(media_type or "").lower(), ".bin")
 
 
-def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[str, int, int]:
-    try:
-        from io import BytesIO
+def _load_normalized_image(content: bytes) -> Image.Image:
+    from io import BytesIO
 
-        with Image.open(BytesIO(content)) as img:
-            width, height = img.size
-            if getattr(img, "is_animated", False):
-                img.seek(0)
-            gray = img.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
-            pixels = list(gray.getdata())
-    except Exception:
-        return "", 0, 0
+    with Image.open(BytesIO(content)) as img:
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+        img = ImageOps.exif_transpose(img)
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            return Image.alpha_composite(bg, rgba).convert("RGB")
+        return img.convert("RGB")
 
-    bits: list[str] = []
+
+def _compute_h_dhash_hex(gray: Image.Image, hash_size: int) -> str:
+    resized = gray.resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+    pixels = resized.tobytes()
     row_width = hash_size + 1
+    value = 0
     for row in range(hash_size):
         row_offset = row * row_width
         for col in range(hash_size):
-            left = pixels[row_offset + col]
-            right = pixels[row_offset + col + 1]
-            bits.append("1" if left > right else "0")
+            value = (value << 1) | (1 if pixels[row_offset + col] > pixels[row_offset + col + 1] else 0)
+    return f"{value:0{hash_size * hash_size // 4}x}"
 
-    return f"{int(''.join(bits), 2):0{hash_size * hash_size // 4}x}", width, height
+
+def _compute_v_dhash_hex(gray: Image.Image, hash_size: int) -> str:
+    resized = gray.resize((hash_size, hash_size + 1), Image.Resampling.LANCZOS)
+    pixels = resized.tobytes()
+    value = 0
+    for row in range(hash_size):
+        row_offset = row * hash_size
+        next_offset = (row + 1) * hash_size
+        for col in range(hash_size):
+            value = (value << 1) | (1 if pixels[row_offset + col] > pixels[next_offset + col] else 0)
+    return f"{value:0{hash_size * hash_size // 4}x}"
+
+
+def _compute_color_hash_hex(rgb: Image.Image, hash_size: int = DEFAULT_COLOR_HASH_SIZE) -> str:
+    small = rgb.resize((hash_size, hash_size), Image.Resampling.BOX)
+    raw = small.tobytes()
+    rg_bits = 0
+    bg_bits = 0
+    for idx in range(0, len(raw), 3):
+        r, g, b = raw[idx], raw[idx + 1], raw[idx + 2]
+        rg_bits = (rg_bits << 1) | (1 if (r - g) > 8 else 0)
+        bg_bits = (bg_bits << 1) | (1 if (b - g) > 8 else 0)
+    hex_len = hash_size * hash_size // 4
+    return f"{rg_bits:0{hex_len}x}{bg_bits:0{hex_len}x}"
+
+
+def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[str, int, int]:
+    try:
+        rgb = _load_normalized_image(content)
+        width, height = rgb.size
+        gray = rgb.convert("L")
+        base_hex = _compute_h_dhash_hex(gray, hash_size)
+        if hash_size != DEFAULT_DHASH_SIZE:
+            return base_hex, width, height
+
+        ext_h = _compute_h_dhash_hex(gray, DEFAULT_EXTENDED_DHASH_SIZE)
+        ext_v = _compute_v_dhash_hex(gray, DEFAULT_EXTENDED_DHASH_SIZE)
+        color_hex = _compute_color_hash_hex(rgb, DEFAULT_COLOR_HASH_SIZE)
+        return f"{base_hex}{ext_h}{ext_v}{color_hex}", width, height
+    except Exception:
+        return "", 0, 0
 
 
 def prepare_image(content: bytes, *, source: str = "", content_type: str = "") -> PreparedImage:
@@ -256,7 +315,157 @@ def prepare_media(
 def hamming_distance(left_hex: str, right_hex: str) -> int:
     if not left_hex or not right_hex:
         return 10**9
-    return (int(left_hex, 16) ^ int(right_hex, 16)).bit_count()
+    common_len = min(len(left_hex), len(right_hex))
+    if common_len <= 0:
+        return 10**9
+    return (int(left_hex[:common_len], 16) ^ int(right_hex[:common_len], 16)).bit_count()
+
+
+def _is_dhash_compatible(
+    left_dhash: str,
+    right_dhash: str,
+    *,
+    dhash_threshold: int = DEFAULT_DHASH_THRESHOLD,
+) -> bool:
+    if not left_dhash or not right_dhash:
+        return False
+    base_len = DEFAULT_DHASH_SIZE * DEFAULT_DHASH_SIZE // 4
+    if len(left_dhash) < base_len or len(right_dhash) < base_len:
+        return hamming_distance(left_dhash, right_dhash) <= dhash_threshold
+
+    if hamming_distance(left_dhash[:base_len], right_dhash[:base_len]) > dhash_threshold:
+        return False
+
+    ext_len = DEFAULT_EXTENDED_DHASH_SIZE * DEFAULT_EXTENDED_DHASH_SIZE // 4
+    color_len = (DEFAULT_COLOR_HASH_SIZE * DEFAULT_COLOR_HASH_SIZE // 4) * 2
+    full_len = base_len + ext_len * 2 + color_len
+    if len(left_dhash) >= full_len and len(right_dhash) >= full_len:
+        h16_left = left_dhash[base_len : base_len + ext_len]
+        h16_right = right_dhash[base_len : base_len + ext_len]
+        v16_left = left_dhash[base_len + ext_len : base_len + ext_len * 2]
+        v16_right = right_dhash[base_len + ext_len : base_len + ext_len * 2]
+        col_left = left_dhash[base_len + ext_len * 2 : full_len]
+        col_right = right_dhash[base_len + ext_len * 2 : full_len]
+
+        h16_dist = hamming_distance(h16_left, h16_right)
+        v16_dist = hamming_distance(v16_left, v16_right)
+        if h16_dist + v16_dist > DEFAULT_EXTENDED_DHASH_THRESHOLD:
+            return False
+
+        row_hex_step = DEFAULT_EXTENDED_DHASH_SIZE // 4
+        max_row_flips = max(
+            hamming_distance(h16_left[idx : idx + row_hex_step], h16_right[idx : idx + row_hex_step])
+            for idx in range(0, ext_len, row_hex_step)
+        )
+        if max_row_flips > DEFAULT_ROW_DHASH_THRESHOLD:
+            return False
+
+        max_col_flips = max(
+            hamming_distance(v16_left[idx : idx + row_hex_step], v16_right[idx : idx + row_hex_step])
+            for idx in range(0, ext_len, row_hex_step)
+        )
+        if max_col_flips > DEFAULT_ROW_DHASH_THRESHOLD:
+            return False
+
+        if hamming_distance(col_left, col_right) > DEFAULT_COLOR_HASH_THRESHOLD:
+            return False
+
+    return True
+
+
+def _crop_foreground_pair(img1: Image.Image, img2: Image.Image) -> tuple[Image.Image, Image.Image]:
+    w, h = img1.size
+    bg_color = img1.getpixel((0, 0))
+    bg1 = (
+        ImageChops.difference(img1, Image.new("RGB", (w, h), bg_color))
+        .convert("L")
+        .point(lambda p: 255 if p > 8 else 0)
+    )
+    bg2 = (
+        ImageChops.difference(img2, Image.new("RGB", (w, h), bg_color))
+        .convert("L")
+        .point(lambda p: 255 if p > 8 else 0)
+    )
+    bbox = ImageChops.lighter(bg1, bg2).getbbox()
+    if bbox:
+        bw = bbox[2] - bbox[0]
+        bh = bbox[3] - bbox[1]
+        if bw >= 32 and bh >= 32 and (bw * bh) < (w * h * 0.75):
+            return img1.crop(bbox), img2.crop(bbox)
+    return img1, img2
+
+
+def _max_pooled_diff(pooled: Image.Image) -> float:
+    raw = pooled.tobytes()
+    if not raw:
+        return 0.0
+    return max((raw[i] + raw[i + 1] + raw[i + 2]) / 3.0 for i in range(0, len(raw), 3))
+
+
+def verify_image_similarity(
+    left_content: bytes,
+    right_content: bytes,
+    *,
+    max_mean_diff: float = DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
+    max_cell_diff: float = DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
+    max_block_diff: float = DEFAULT_PIXEL_MAX_BLOCK_DIFF_THRESHOLD,
+) -> bool:
+    if not left_content or not right_content:
+        return False
+    try:
+        img1 = _load_normalized_image(left_content)
+        img2 = _load_normalized_image(right_content)
+    except Exception:
+        return False
+
+    # 1. 32x32 网格均值与峰值校验，拦截全局结构或颜色差异
+    g1 = img1.resize((32, 32), Image.Resampling.BOX)
+    g2 = img2.resize((32, 32), Image.Resampling.BOX)
+    cell_raw = ImageChops.difference(g1, g2).tobytes()
+    cell_vals = [(cell_raw[i] + cell_raw[i + 1] + cell_raw[i + 2]) / 3.0 for i in range(0, len(cell_raw), 3)]
+    if not cell_vals:
+        return False
+    if (sum(cell_vals) / len(cell_vals)) > max_mean_diff or max(cell_vals) > max_cell_diff:
+        return False
+
+    # 2. 对齐到较小分辨率后剥离纯色背景，按 8x8 像素分块做刚性对齐局部峰值校验，拦截同底色不同字的截图/表情包
+    same_size = img1.size == img2.size
+    min_w = min(img1.width, img2.width)
+    min_h = min(img1.height, img2.height)
+    scale = min(1.0, 640.0 / max(min_w, min_h))
+    w = max(32, int(round(min_w * scale)))
+    h = max(32, int(round(min_h * scale)))
+    s1 = img1.resize((w, h), Image.Resampling.LANCZOS)
+    s2 = img2.resize((w, h), Image.Resampling.LANCZOS)
+    c1, c2 = _crop_foreground_pair(s1, s2)
+    b1 = c1.filter(ImageFilter.GaussianBlur(radius=0.8))
+    b2 = c2.filter(ImageFilter.GaussianBlur(radius=0.8))
+    gw = max(8, c1.width // 8)
+    gh = max(8, c1.height // 8)
+
+    zero_shift_pooled = ImageChops.difference(b1, b2).resize((gw, gh), Image.Resampling.BOX)
+    if _max_pooled_diff(zero_shift_pooled) <= max_block_diff:
+        return True
+    if same_size:
+        return False
+
+    best_pooled = zero_shift_pooled
+    cw, ch = b1.size
+    bg_pixel = b2.getpixel((0, 0))
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            shifted = Image.new("RGB", (cw, ch), bg_pixel)
+            src_x0 = max(0, -dx)
+            src_y0 = max(0, -dy)
+            src_x1 = min(cw, cw - dx)
+            src_y1 = min(ch, ch - dy)
+            shifted.paste(b2.crop((src_x0, src_y0, src_x1, src_y1)), (max(0, dx), max(0, dy)))
+            pooled = ImageChops.difference(b1, shifted).resize((gw, gh), Image.Resampling.BOX)
+            best_pooled = ImageChops.darker(best_pooled, pooled)
+
+    return _max_pooled_diff(best_pooled) <= max_block_diff
 
 
 def is_near_duplicate(
@@ -266,14 +475,14 @@ def is_near_duplicate(
     right_width: int,
     right_height: int,
     *,
+    right_content: bytes | None = None,
+    right_content_loader: Callable[[], bytes | None] | None = None,
     dhash_threshold: int = DEFAULT_DHASH_THRESHOLD,
     aspect_ratio_tolerance: float = DEFAULT_ASPECT_RATIO_TOLERANCE,
 ) -> bool:
     if left.sha256 and left.sha256 == right_sha256:
         return True
     if not left.dhash or not right_dhash:
-        return False
-    if hamming_distance(left.dhash, right_dhash) > dhash_threshold:
         return False
 
     left_ratio = left.aspect_ratio
@@ -283,7 +492,17 @@ def is_near_duplicate(
     if right_ratio <= 0:
         return False
     ratio_diff = abs(left_ratio - right_ratio) / max(left_ratio, right_ratio)
-    return ratio_diff <= aspect_ratio_tolerance
+    if ratio_diff > aspect_ratio_tolerance:
+        return False
+
+    if not _is_dhash_compatible(left.dhash, right_dhash, dhash_threshold=dhash_threshold):
+        return False
+
+    if right_content is None and right_content_loader is not None:
+        right_content = right_content_loader()
+    if right_content is not None and left.content:
+        return verify_image_similarity(left.content, right_content)
+    return True
 
 
 def random_id(prefix: str = "") -> str:
