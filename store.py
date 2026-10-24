@@ -5,7 +5,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from astrbot.api import logger
@@ -28,6 +28,7 @@ try:
         QUOTES_FILENAME,
         SCHEMA_VERSION,
         SENT_INDEX_FILENAME,
+        SENT_TIMESTAMP_TOLERANCE_SECONDS,
     )
     from .models import (
         ForwardNode,
@@ -51,6 +52,7 @@ try:
         read_json,
         rel_image_path,
         rel_media_path,
+        score_image_delete_match,
     )
 except ImportError:  # pragma: no cover
     from constants import (
@@ -66,6 +68,7 @@ except ImportError:  # pragma: no cover
         QUOTES_FILENAME,
         SCHEMA_VERSION,
         SENT_INDEX_FILENAME,
+        SENT_TIMESTAMP_TOLERANCE_SECONDS,
     )
     from models import (
         ForwardNode,
@@ -89,6 +92,7 @@ except ImportError:  # pragma: no cover
         read_json,
         rel_image_path,
         rel_media_path,
+        score_image_delete_match,
     )
 
 
@@ -280,10 +284,22 @@ class QuoteRepository:
         if not matches:
             return None
         if replied_at > 0:
-            bounded = [item for item in matches if item.sent_at <= replied_at]
+            bounded = [
+                item
+                for item in matches
+                if item.sent_at <= replied_at + SENT_TIMESTAMP_TOLERANCE_SECONDS
+            ]
             if bounded:
                 matches = bounded
-        matches.sort(key=lambda item: item.sent_at, reverse=True)
+            matches.sort(
+                key=lambda item: (
+                    0 if abs(item.sent_at - replied_at) <= SENT_TIMESTAMP_TOLERANCE_SECONDS else 1,
+                    abs(item.sent_at - replied_at),
+                    -item.sent_at,
+                )
+            )
+        else:
+            matches.sort(key=lambda item: item.sent_at, reverse=True)
         return matches[0].quote_id if matches else None
 
     def find_sent_quote_id_by_image_signature(
@@ -297,23 +313,147 @@ class QuoteRepository:
             return None
         store = self.get_store(session_key)
         records = store.load_sent_records()
-        assets_by_sha = {item.sha256: item for item in store.load_assets() if item.sha256}
-        matches: list[SentQuoteRecord] = []
+        if not records:
+            return None
+
+        ordered_sessions = [session_key, *[k for k in self.session_keys() if k != session_key]]
+        assets_by_sha: dict[str, ImageAsset] = {}
+        assets_by_id: dict[str, ImageAsset] = {}
+        quotes_by_id: dict[str, Quote] = {}
+        cache_paths_by_quote_id: dict[str, Path] = {}
+
+        for key in ordered_sessions:
+            s = self.get_store(key)
+            for asset in s.load_assets():
+                if asset.sha256 and asset.sha256 not in assets_by_sha:
+                    assets_by_sha[asset.sha256] = asset
+                if asset.asset_id and asset.asset_id not in assets_by_id:
+                    assets_by_id[asset.asset_id] = asset
+            for q in s.load_quotes():
+                if q.id and q.id not in quotes_by_id:
+                    quotes_by_id[q.id] = q
+                    cp = s.cache_path(q.id)
+                    if cp.exists():
+                        cache_paths_by_quote_id[q.id] = cp
+
+        for record in records:
+            if record.quote_id and record.quote_id not in cache_paths_by_quote_id:
+                cp = store.cache_path(record.quote_id)
+                if cp.exists():
+                    cache_paths_by_quote_id[record.quote_id] = cp
+
+        asset_bytes_cache: dict[str, bytes | None] = {}
+        cache_prepared_map: dict[str, PreparedImage | None] = {}
+
+        def _load_asset_by_sha(sha: str, qid: str) -> bytes | None:
+            if sha in asset_bytes_cache:
+                return asset_bytes_cache[sha]
+            asset = assets_by_sha.get(sha)
+            if asset is not None:
+                data = self._read_asset_bytes(asset)
+                asset_bytes_cache[sha] = data
+                return data
+            cp = cache_paths_by_quote_id.get(qid)
+            if cp is not None:
+                try:
+                    data = cp.read_bytes()
+                    asset_bytes_cache[sha] = data
+                    return data
+                except Exception:
+                    pass
+            asset_bytes_cache[sha] = None
+            return None
+
+        def _prepare_cached_card(qid: str) -> PreparedImage | None:
+            if qid in cache_prepared_map:
+                return cache_prepared_map[qid]
+            cp = cache_paths_by_quote_id.get(qid)
+            if cp is None:
+                cache_prepared_map[qid] = None
+                return None
+            try:
+                prepared = prepare_image(cp.read_bytes(), source=cp.name)
+                cache_prepared_map[qid] = prepared if prepared.sha256 else None
+                return cache_prepared_map[qid]
+            except Exception:
+                cache_prepared_map[qid] = None
+                return None
+
+        matches: list[tuple[float, SentQuoteRecord]] = []
         candidate_count = 0
         for record in records:
-            if not record.quote_id or len(record.image_signatures) != 1:
+            if not record.quote_id:
                 continue
-            candidate_count += 1
-            signature = record.image_signatures[0]
-            if is_near_duplicate(
-                image,
-                signature.sha256,
-                signature.dhash,
-                signature.width,
-                signature.height,
-                right_content_loader=lambda sha=signature.sha256: self._read_asset_bytes(assets_by_sha.get(sha)),
-            ):
-                matches.append(record)
+
+            candidates: list[tuple[ImageSignature, Callable[[], bytes | None]]] = []
+            if record.image_signatures:
+                for sig in record.image_signatures:
+                    candidates.append(
+                        (
+                            sig,
+                            lambda sha=sig.sha256, qid=record.quote_id: _load_asset_by_sha(sha, qid),
+                        )
+                    )
+            else:
+                # 兼容旧版发送记录：若为已缓存的渲染语录卡片或含图语录，动态回填签名候选
+                prepared_card = _prepare_cached_card(record.quote_id)
+                if prepared_card is not None:
+                    candidates.append(
+                        (
+                            ImageSignature(
+                                sha256=prepared_card.sha256,
+                                dhash=prepared_card.dhash,
+                                width=prepared_card.width,
+                                height=prepared_card.height,
+                            ),
+                            lambda p=prepared_card: p.content,
+                        )
+                    )
+                quote = quotes_by_id.get(record.quote_id)
+                if quote is not None:
+                    seen_ids: set[str] = set()
+                    asset_ids = list(quote.image_ids or [])
+                    for seg in quote.segments:
+                        if seg.type == "image" and seg.asset_id:
+                            asset_ids.append(seg.asset_id)
+                    for aid in asset_ids:
+                        if not aid or aid in seen_ids:
+                            continue
+                        seen_ids.add(aid)
+                        asset = assets_by_id.get(aid)
+                        if asset is None or not asset.sha256:
+                            continue
+                        candidates.append(
+                            (
+                                ImageSignature(
+                                    sha256=asset.sha256,
+                                    dhash=asset.dhash,
+                                    width=asset.width,
+                                    height=asset.height,
+                                ),
+                                lambda sha=asset.sha256, qid=record.quote_id: _load_asset_by_sha(sha, qid),
+                            )
+                        )
+
+            if not candidates:
+                continue
+
+            best_score: float | None = None
+            for sig, loader in candidates:
+                candidate_count += 1
+                score = score_image_delete_match(
+                    image,
+                    sig.sha256,
+                    sig.dhash,
+                    sig.width,
+                    sig.height,
+                    right_content_loader=loader,
+                )
+                if score is not None and (best_score is None or score < best_score):
+                    best_score = score
+
+            if best_score is not None:
+                matches.append((best_score, record))
 
         if not matches:
             logger.info(
@@ -321,16 +461,32 @@ class QuoteRepository:
                 f"session={session_key}, candidates={candidate_count}, sha256={image.sha256[:12]}, dhash={image.dhash[:12]}"
             )
             return None
+
         if replied_at > 0:
-            bounded = [item for item in matches if item.sent_at <= replied_at]
+            bounded = [
+                item
+                for item in matches
+                if item[1].sent_at <= replied_at + SENT_TIMESTAMP_TOLERANCE_SECONDS
+            ]
             if bounded:
                 matches = bounded
-        matches.sort(key=lambda item: item.sent_at, reverse=True)
+            matches.sort(
+                key=lambda item: (
+                    0 if abs(item[1].sent_at - replied_at) <= SENT_TIMESTAMP_TOLERANCE_SECONDS else 1,
+                    round(item[0], 1),
+                    abs(item[1].sent_at - replied_at),
+                    -item[1].sent_at,
+                )
+            )
+        else:
+            matches.sort(key=lambda item: (round(item[0], 1), -item[1].sent_at))
+
+        best_score, best_record = matches[0]
         logger.info(
             "删除语录近似图片匹配命中: "
-            f"session={session_key}, matches={len(matches)}, quote_id={matches[0].quote_id}"
+            f"session={session_key}, matches={len(matches)}, score={best_score:.2f}, quote_id={best_record.quote_id}"
         )
-        return matches[0].quote_id if matches else None
+        return best_record.quote_id
 
     async def create_quote_with_segments(
         self,

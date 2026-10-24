@@ -34,6 +34,11 @@ try:
         DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
         DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
         DEFAULT_ROW_DHASH_THRESHOLD,
+        DELETE_MATCH_ASPECT_RATIO_TOLERANCE,
+        DELETE_MATCH_DHASH_THRESHOLD,
+        DELETE_MATCH_MAX_BLOCK_DIFF_THRESHOLD,
+        DELETE_MATCH_MAX_CELL_DIFF_THRESHOLD,
+        DELETE_MATCH_MEAN_DIFF_THRESHOLD,
         GROUPS_DIRNAME,
         MEDIA_DIRNAME,
         PLUGIN_NAME,
@@ -52,6 +57,11 @@ except ImportError:  # pragma: no cover
         DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
         DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
         DEFAULT_ROW_DHASH_THRESHOLD,
+        DELETE_MATCH_ASPECT_RATIO_TOLERANCE,
+        DELETE_MATCH_DHASH_THRESHOLD,
+        DELETE_MATCH_MAX_BLOCK_DIFF_THRESHOLD,
+        DELETE_MATCH_MAX_CELL_DIFF_THRESHOLD,
+        DELETE_MATCH_MEAN_DIFF_THRESHOLD,
         GROUPS_DIRNAME,
         MEDIA_DIRNAME,
         PLUGIN_NAME,
@@ -208,6 +218,10 @@ def guess_media_extension(source_name: str = "", content_type: str = "", media_t
     return default_map.get(str(media_type or "").lower(), ".bin")
 
 
+def _has_transparency(img: Image.Image) -> bool:
+    return img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+
+
 def _load_normalized_image(content: bytes) -> Image.Image:
     from io import BytesIO
 
@@ -215,11 +229,30 @@ def _load_normalized_image(content: bytes) -> Image.Image:
         if getattr(img, "is_animated", False):
             img.seek(0)
         img = ImageOps.exif_transpose(img)
-        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        if _has_transparency(img):
             rgba = img.convert("RGBA")
             bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
             return Image.alpha_composite(bg, rgba).convert("RGB")
         return img.convert("RGB")
+
+
+def _load_normalized_image_variants(content: bytes) -> tuple[Image.Image, list[Image.Image]]:
+    from io import BytesIO
+
+    with Image.open(BytesIO(content)) as img:
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+        img = ImageOps.exif_transpose(img)
+        if _has_transparency(img):
+            rgba = img.convert("RGBA")
+            white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            white_rgb = Image.alpha_composite(white_bg, rgba).convert("RGB")
+            black_bg = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
+            black_rgb = Image.alpha_composite(black_bg, rgba).convert("RGB")
+            raw_rgb = img.convert("RGB")
+            return white_rgb, [white_rgb, black_rgb, raw_rgb]
+        rgb = img.convert("RGB")
+        return rgb, [rgb]
 
 
 def _compute_h_dhash_hex(gray: Image.Image, hash_size: int) -> str:
@@ -257,6 +290,19 @@ def _compute_color_hash_hex(rgb: Image.Image, hash_size: int = DEFAULT_COLOR_HAS
         bg_bits = (bg_bits << 1) | (1 if (b - g) > 8 else 0)
     hex_len = hash_size * hash_size // 4
     return f"{rg_bits:0{hex_len}x}{bg_bits:0{hex_len}x}"
+
+
+def compute_legacy_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> str:
+    from io import BytesIO
+
+    try:
+        with Image.open(BytesIO(content)) as img:
+            if getattr(img, "is_animated", False):
+                img.seek(0)
+            gray = img.convert("L")
+            return _compute_h_dhash_hex(gray, hash_size)
+    except Exception:
+        return ""
 
 
 def compute_dhash(content: bytes, hash_size: int = DEFAULT_DHASH_SIZE) -> tuple[str, int, int]:
@@ -402,31 +448,22 @@ def _max_pooled_diff(pooled: Image.Image) -> float:
     return max((raw[i] + raw[i + 1] + raw[i + 2]) / 3.0 for i in range(0, len(raw), 3))
 
 
-def verify_image_similarity(
-    left_content: bytes,
-    right_content: bytes,
+def _compute_pair_diff_metrics(
+    img1: Image.Image,
+    img2: Image.Image,
     *,
-    max_mean_diff: float = DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
-    max_cell_diff: float = DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
-    max_block_diff: float = DEFAULT_PIXEL_MAX_BLOCK_DIFF_THRESHOLD,
-) -> bool:
-    if not left_content or not right_content:
-        return False
-    try:
-        img1 = _load_normalized_image(left_content)
-        img2 = _load_normalized_image(right_content)
-    except Exception:
-        return False
-
-    # 1. 32x32 网格均值与峰值校验，拦截全局结构或颜色差异
+    allow_same_size_shift: bool = False,
+    zero_shift_fast_pass: float = 0.0,
+) -> tuple[float, float, float]:
+    # 1. 32x32 网格均值与峰值校验，评估全局结构与颜色差异
     g1 = img1.resize((32, 32), Image.Resampling.BOX)
     g2 = img2.resize((32, 32), Image.Resampling.BOX)
     cell_raw = ImageChops.difference(g1, g2).tobytes()
     cell_vals = [(cell_raw[i] + cell_raw[i + 1] + cell_raw[i + 2]) / 3.0 for i in range(0, len(cell_raw), 3)]
     if not cell_vals:
-        return False
-    if (sum(cell_vals) / len(cell_vals)) > max_mean_diff or max(cell_vals) > max_cell_diff:
-        return False
+        return 255.0, 255.0, 255.0
+    mean_diff = sum(cell_vals) / len(cell_vals)
+    max_cell_diff = max(cell_vals)
 
     # 2. 对齐到较小分辨率后剥离纯色背景，按 8x8 像素分块做刚性对齐局部峰值校验，拦截同底色不同字的截图/表情包
     same_size = img1.size == img2.size
@@ -444,10 +481,9 @@ def verify_image_similarity(
     gh = max(8, c1.height // 8)
 
     zero_shift_pooled = ImageChops.difference(b1, b2).resize((gw, gh), Image.Resampling.BOX)
-    if _max_pooled_diff(zero_shift_pooled) <= max_block_diff:
-        return True
-    if same_size:
-        return False
+    zero_block_diff = _max_pooled_diff(zero_shift_pooled)
+    if (zero_shift_fast_pass > 0 and zero_block_diff <= zero_shift_fast_pass) or (same_size and not allow_same_size_shift):
+        return mean_diff, max_cell_diff, zero_block_diff
 
     best_pooled = zero_shift_pooled
     cw, ch = b1.size
@@ -465,7 +501,69 @@ def verify_image_similarity(
             pooled = ImageChops.difference(b1, shifted).resize((gw, gh), Image.Resampling.BOX)
             best_pooled = ImageChops.darker(best_pooled, pooled)
 
-    return _max_pooled_diff(best_pooled) <= max_block_diff
+    return mean_diff, max_cell_diff, _max_pooled_diff(best_pooled)
+
+
+def _compute_image_diff_metrics(
+    left_content: bytes,
+    right_content: bytes,
+    *,
+    allow_same_size_shift: bool = False,
+    zero_shift_fast_pass: float = 0.0,
+) -> tuple[float, float, float] | None:
+    if not left_content or not right_content:
+        return None
+    try:
+        img1, variants1 = _load_normalized_image_variants(left_content)
+        img2, variants2 = _load_normalized_image_variants(right_content)
+    except Exception:
+        return None
+
+    best = _compute_pair_diff_metrics(
+        img1,
+        img2,
+        allow_same_size_shift=allow_same_size_shift,
+        zero_shift_fast_pass=zero_shift_fast_pass,
+    )
+    # 若其中一方含透明通道而另一方已被协议端转码为不透明图（黑底或直转 RGB），测试候选背景合成
+    if (len(variants1) > 1) != (len(variants2) > 1):
+        for v1 in variants1:
+            for v2 in variants2:
+                if v1 is img1 and v2 is img2:
+                    continue
+                candidate = _compute_pair_diff_metrics(
+                    v1,
+                    v2,
+                    allow_same_size_shift=allow_same_size_shift,
+                    zero_shift_fast_pass=zero_shift_fast_pass,
+                )
+                if (candidate[2] + candidate[0]) < (best[2] + best[0]):
+                    best = candidate
+    return best
+
+
+def verify_image_similarity(
+    left_content: bytes,
+    right_content: bytes,
+    *,
+    max_mean_diff: float = DEFAULT_PIXEL_MEAN_DIFF_THRESHOLD,
+    max_cell_diff: float = DEFAULT_PIXEL_MAX_CELL_DIFF_THRESHOLD,
+    max_block_diff: float = DEFAULT_PIXEL_MAX_BLOCK_DIFF_THRESHOLD,
+) -> bool:
+    metrics = _compute_image_diff_metrics(
+        left_content,
+        right_content,
+        allow_same_size_shift=False,
+        zero_shift_fast_pass=max_block_diff,
+    )
+    if metrics is None:
+        return False
+    mean_diff, cell_diff, block_diff = metrics
+    return (
+        mean_diff <= max_mean_diff
+        and cell_diff <= max_cell_diff
+        and block_diff <= max_block_diff
+    )
 
 
 def is_near_duplicate(
@@ -495,7 +593,13 @@ def is_near_duplicate(
     if ratio_diff > aspect_ratio_tolerance:
         return False
 
-    if not _is_dhash_compatible(left.dhash, right_dhash, dhash_threshold=dhash_threshold):
+    base_len = DEFAULT_DHASH_SIZE * DEFAULT_DHASH_SIZE // 4
+    dhash_ok = _is_dhash_compatible(left.dhash, right_dhash, dhash_threshold=dhash_threshold)
+    if not dhash_ok and len(right_dhash) == base_len and left.content:
+        legacy_left = compute_legacy_dhash(left.content)
+        if legacy_left and hamming_distance(legacy_left, right_dhash) <= dhash_threshold:
+            dhash_ok = True
+    if not dhash_ok:
         return False
 
     if right_content is None and right_content_loader is not None:
@@ -503,6 +607,77 @@ def is_near_duplicate(
     if right_content is not None and left.content:
         return verify_image_similarity(left.content, right_content)
     return True
+
+
+def score_image_delete_match(
+    left: PreparedImage,
+    right_sha256: str,
+    right_dhash: str,
+    right_width: int,
+    right_height: int,
+    *,
+    right_content: bytes | None = None,
+    right_content_loader: Callable[[], bytes | None] | None = None,
+    dhash_threshold: int = DELETE_MATCH_DHASH_THRESHOLD,
+    aspect_ratio_tolerance: float = DELETE_MATCH_ASPECT_RATIO_TOLERANCE,
+    max_mean_diff: float = DELETE_MATCH_MEAN_DIFF_THRESHOLD,
+    max_cell_diff: float = DELETE_MATCH_MAX_CELL_DIFF_THRESHOLD,
+    max_block_diff: float = DELETE_MATCH_MAX_BLOCK_DIFF_THRESHOLD,
+) -> float | None:
+    if left.sha256 and left.sha256 == right_sha256:
+        return 0.0
+
+    left_ratio = left.aspect_ratio
+    if not left_ratio or right_width <= 0 or right_height <= 0:
+        return None
+    right_ratio = right_width / right_height
+    if right_ratio <= 0:
+        return None
+    ratio_diff = abs(left_ratio - right_ratio) / max(left_ratio, right_ratio)
+    if ratio_diff > aspect_ratio_tolerance:
+        return None
+
+    base_len = DEFAULT_DHASH_SIZE * DEFAULT_DHASH_SIZE // 4
+    h8_dist = (
+        hamming_distance(left.dhash[:base_len], right_dhash[:base_len])
+        if (left.dhash and right_dhash)
+        else 10**9
+    )
+    if h8_dist > dhash_threshold and left.content and right_dhash:
+        legacy_left = compute_legacy_dhash(left.content)
+        if legacy_left:
+            h8_dist = min(h8_dist, hamming_distance(legacy_left, right_dhash[:base_len]))
+
+    if right_content is None and right_content_loader is not None:
+        right_content = right_content_loader()
+
+    if right_content is not None and left.content:
+        if h8_dist > dhash_threshold and left.dhash:
+            right_modern_dhash, _, _ = compute_dhash(right_content)
+            if right_modern_dhash:
+                h8_dist = min(h8_dist, hamming_distance(left.dhash[:base_len], right_modern_dhash[:base_len]))
+            right_legacy_dhash = compute_legacy_dhash(right_content)
+            if right_legacy_dhash:
+                h8_dist = min(h8_dist, hamming_distance(left.dhash[:base_len], right_legacy_dhash[:base_len]))
+        if h8_dist > dhash_threshold:
+            return None
+
+        metrics = _compute_image_diff_metrics(
+            left.content,
+            right_content,
+            allow_same_size_shift=True,
+            zero_shift_fast_pass=max_block_diff,
+        )
+        if metrics is None:
+            return None
+        mean_diff, cell_diff, block_diff = metrics
+        if mean_diff > max_mean_diff or cell_diff > max_cell_diff or block_diff > max_block_diff:
+            return None
+        return block_diff + mean_diff * 2.0 + h8_dist * 1.5
+
+    if h8_dist > min(dhash_threshold, 8):
+        return None
+    return float(h8_dist) * 6.0
 
 
 def random_id(prefix: str = "") -> str:

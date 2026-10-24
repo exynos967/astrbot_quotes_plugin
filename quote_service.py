@@ -23,6 +23,7 @@ try:
         is_valid_qq,
         make_session_key,
         normalize_quote_text,
+        prepare_image,
         random_id,
         sha256_bytes,
     )
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover
         is_valid_qq,
         make_session_key,
         normalize_quote_text,
+        prepare_image,
         random_id,
         sha256_bytes,
     )
@@ -275,6 +277,7 @@ class QuoteService:
                 path=str(cache_path),
                 quote_id=quote.id,
                 delete_fingerprint=await self._fingerprint_image_path(cache_path),
+                delete_image_signatures=self._signatures_from_image_path(cache_path),
             )
 
         signature = await self.napcat_service.resolve_signature_name(
@@ -290,12 +293,14 @@ class QuoteService:
                 path=str(cache_path),
                 quote_id=quote.id,
                 delete_fingerprint=await self._fingerprint_image_path(cache_path),
+                delete_image_signatures=self._signatures_from_image_path(cache_path),
             )
         return CommandResponse(
             kind="image_url",
             url=rendered_url,
             quote_id=quote.id,
             delete_fingerprint=await self._fingerprint_image_url(rendered_url),
+            delete_image_signatures=await self._signatures_from_image_url(rendered_url),
         )
 
     async def delete_quote(self, quote_id: str) -> bool:
@@ -622,8 +627,28 @@ class QuoteService:
         return self._fingerprint_standard_quote(quote)
 
     def build_delete_image_signatures(self, quote: Quote) -> list[ImageSignature]:
-        signature = self._single_standard_image_signature(quote)
-        return [signature] if signature is not None else []
+        signatures: list[ImageSignature] = []
+        seen_ids: set[str] = set()
+        asset_ids = list(quote.image_ids or [])
+        for segment in quote.segments:
+            if segment.type == "image" and segment.asset_id:
+                asset_ids.append(segment.asset_id)
+        for asset_id in asset_ids:
+            if not asset_id or asset_id in seen_ids:
+                continue
+            seen_ids.add(asset_id)
+            asset = self.repository.find_asset(quote.group, asset_id)
+            if asset is None or not asset.sha256:
+                continue
+            signatures.append(
+                ImageSignature(
+                    sha256=asset.sha256,
+                    dhash=asset.dhash,
+                    width=asset.width,
+                    height=asset.height,
+                )
+            )
+        return signatures
 
     async def _fingerprint_from_reply_payload(
         self,
@@ -650,6 +675,10 @@ class QuoteService:
         if len(normalized) == 1 and normalized[0].type == "image" and normalized[0].image is not None:
             return [self._fingerprint_image_sha(normalized[0].image.sha256)], normalized[0].image
 
+        first_image = next(
+            (segment.image for segment in normalized if segment.type == "image" and segment.image is not None),
+            None,
+        )
         return [
             self._hash_payload(
                 {
@@ -660,7 +689,7 @@ class QuoteService:
                     ],
                 }
             )
-        ], None
+        ], first_image
 
     def _forward_delete_fingerprints(self, nodes: list[Any]) -> tuple[list[str], Any | None]:
         # 长文本/图文语录会被 AstrBot 自动包成合并转发（AstrNa 可能再拆成多节点），
@@ -756,6 +785,23 @@ class QuoteService:
             logger.info(f"计算语录图片指纹失败: {exc}")
         return ""
 
+    def _signatures_from_image_path(self, path: Path) -> list[ImageSignature]:
+        try:
+            if path.exists():
+                prepared = prepare_image(path.read_bytes(), source=path.name)
+                if prepared.sha256:
+                    return [
+                        ImageSignature(
+                            sha256=prepared.sha256,
+                            dhash=prepared.dhash,
+                            width=prepared.width,
+                            height=prepared.height,
+                        )
+                    ]
+        except Exception as exc:
+            logger.info(f"计算语录图片感知哈希签名失败: {exc}")
+        return []
+
     async def _fingerprint_image_url(self, url: str) -> str:
         if not url:
             return ""
@@ -774,6 +820,34 @@ class QuoteService:
         except Exception as exc:
             logger.info(f"计算语录图片 URL 指纹失败: {exc}")
         return ""
+
+    async def _signatures_from_image_url(self, url: str) -> list[ImageSignature]:
+        if not url:
+            return []
+        try:
+            if url.startswith("file://"):
+                from urllib.parse import unquote, urlparse
+
+                parsed = urlparse(url)
+                local_path = Path(unquote(parsed.path))
+                return self._signatures_from_image_path(local_path)
+
+            if url.startswith("http") and self.http_client is not None:
+                response = await self.http_client.get(url)
+                if getattr(response, "status_code", 200) < 400:
+                    prepared = prepare_image(bytes(response.content), source=url)
+                    if prepared.sha256:
+                        return [
+                            ImageSignature(
+                                sha256=prepared.sha256,
+                                dhash=prepared.dhash,
+                                width=prepared.width,
+                                height=prepared.height,
+                            )
+                        ]
+        except Exception as exc:
+            logger.info(f"计算语录图片 URL 感知哈希签名失败: {exc}")
+        return []
 
     async def _component_payload(self, component: Any) -> dict[str, Any] | None:
         if Comp is None:
