@@ -152,8 +152,15 @@ class QuoteService:
             f"segments={len(all_segments)}, images={image_count}"
         )
         if image_count:
-            return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。")
-        return CommandResponse(kind="plain", text=f"已收录 {quote.name} 的语录：{quote.text}")
+            text = f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。"
+        else:
+            text = f"已收录 {quote.name} 的语录：{quote.text}"
+        return CommandResponse(
+            kind="plain",
+            text=text,
+            quote_id=quote.id,
+            delete_fingerprint=self._fingerprint_plain_text(text),
+        )
 
     async def _add_forward_quote(
         self,
@@ -224,9 +231,12 @@ class QuoteService:
             "上传聊天记录语录成功: "
             f"quote_id={quote.id}, session={session_key}, target_qq={target_qq}, messages={message_count}"
         )
+        text = f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。"
         return CommandResponse(
             kind="plain",
-            text=f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。",
+            text=text,
+            quote_id=quote.id,
+            delete_fingerprint=self._fingerprint_plain_text(text),
         )
 
     async def random_quote(self, event: Any, uid: str = "", silent_if_empty: bool = False) -> CommandResponse | None:
