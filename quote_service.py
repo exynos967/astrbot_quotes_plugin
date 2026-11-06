@@ -14,7 +14,13 @@ except Exception:  # pragma: no cover
     Comp = None  # type: ignore
 
 try:
-    from .constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
+    from .constants import (
+        DUPLICATE_IMAGE_MESSAGE,
+        DUPLICATE_QUOTE_MESSAGE,
+        QUOTE_LIST_PAGE_SIZE,
+        QUOTE_LIST_PREVIEW_LIMIT,
+        QUOTE_UPLOADED_MESSAGE,
+    )
     from .models import CommandResponse, ForwardNode, ForwardSegment, ImageSignature, Quote
     from .napcat_service import NapcatService
     from .renderer import QuoteRenderer
@@ -28,7 +34,13 @@ try:
         sha256_bytes,
     )
 except ImportError:  # pragma: no cover
-    from constants import DUPLICATE_IMAGE_MESSAGE, DUPLICATE_QUOTE_MESSAGE
+    from constants import (
+        DUPLICATE_IMAGE_MESSAGE,
+        DUPLICATE_QUOTE_MESSAGE,
+        QUOTE_LIST_PAGE_SIZE,
+        QUOTE_LIST_PREVIEW_LIMIT,
+        QUOTE_UPLOADED_MESSAGE,
+    )
     from models import CommandResponse, ForwardNode, ForwardSegment, ImageSignature, Quote
     from napcat_service import NapcatService
     from renderer import QuoteRenderer
@@ -69,7 +81,14 @@ class QuoteService:
         self.image_signature_use_group = image_signature_use_group
         self.blacklist = blacklist
 
-    async def add_quote(self, event: Any, uid: str = "") -> CommandResponse:
+    async def add_quote(
+        self,
+        event: Any,
+        uid: str = "",
+        *,
+        command_name: str = "上传",
+        success_message: str = QUOTE_UPLOADED_MESSAGE,
+    ) -> CommandResponse:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
         reply_message_id = self.get_reply_message_id(event)
         reply_payload = await self.napcat_service.fetch_onebot_message(event, reply_message_id)
@@ -88,12 +107,13 @@ class QuoteService:
                 mention_qq=mention_qq,
                 forward_id=forward_id,
                 forward_payload=forward_payload,
+                success_message=success_message,
             )
 
         reply_segments = await self.image_service.build_reply_segments(event, reply_payload.get("message"))
         current_segments = await self.image_service.build_current_segments(
             event,
-            command_name="上传",
+            command_name=command_name,
             explicit_qq=explicit_qq,
         )
         all_segments = self._normalize_pending_segments([*reply_segments, *current_segments])
@@ -151,15 +171,11 @@ class QuoteService:
             f"quote_id={quote.id}, session={session_key}, target_qq={target_qq}, "
             f"segments={len(all_segments)}, images={image_count}"
         )
-        if image_count:
-            text = f"已收录 {quote.name} 的语录，并保存 {image_count} 张图片。"
-        else:
-            text = f"已收录 {quote.name} 的语录：{quote.text}"
         return CommandResponse(
             kind="plain",
-            text=text,
+            text=success_message,
             quote_id=quote.id,
-            delete_fingerprint=self._fingerprint_plain_text(text),
+            delete_fingerprint=self._fingerprint_plain_text(success_message),
         )
 
     async def _add_forward_quote(
@@ -172,6 +188,7 @@ class QuoteService:
         mention_qq: str,
         forward_id: str | None,
         forward_payload: dict[str, Any] | None,
+        success_message: str = QUOTE_UPLOADED_MESSAGE,
     ) -> CommandResponse:
         nodes = await self.image_service.build_forward_nodes(
             event,
@@ -231,15 +248,22 @@ class QuoteService:
             "上传聊天记录语录成功: "
             f"quote_id={quote.id}, session={session_key}, target_qq={target_qq}, messages={message_count}"
         )
-        text = f"已收录 {quote.name} 的聊天记录语录，共 {message_count} 条消息。"
         return CommandResponse(
             kind="plain",
-            text=text,
+            text=success_message,
             quote_id=quote.id,
-            delete_fingerprint=self._fingerprint_plain_text(text),
+            delete_fingerprint=self._fingerprint_plain_text(success_message),
         )
 
-    async def random_quote(self, event: Any, uid: str = "", silent_if_empty: bool = False) -> CommandResponse | None:
+    async def random_quote(
+        self,
+        event: Any,
+        uid: str = "",
+        silent_if_empty: bool = False,
+        *,
+        noun: str = "语录",
+        upload_command: str = "上传",
+    ) -> CommandResponse | None:
         session_key = make_session_key(event.get_group_id(), event.get_sender_id())
         target_session = None if self.global_mode else session_key
         explicit_qq = uid.strip() if is_valid_qq(uid) else ""
@@ -254,9 +278,17 @@ class QuoteService:
             if silent_if_empty:
                 return None
             if only_qq:
-                text = "这个用户还没有语录哦~" if self.global_mode else "这个用户在本会话还没有语录哦~"
+                text = (
+                    f"这个用户还没有{noun}哦~"
+                    if self.global_mode
+                    else f"这个用户在本会话还没有{noun}哦~"
+                )
             else:
-                text = "还没有语录，先用 上传 保存一条吧~" if self.global_mode else "本会话还没有语录，先用 上传 保存一条吧~"
+                text = (
+                    f"还没有{noun}，先用 {upload_command} 保存一条吧~"
+                    if self.global_mode
+                    else f"本会话还没有{noun}，先用 {upload_command} 保存一条吧~"
+                )
             return CommandResponse(kind="plain", text=text)
 
         logger.info(f"随机语录命中: quote_id={quote.id}, session={quote.group}, target_qq={only_qq or '*'}")
@@ -312,6 +344,117 @@ class QuoteService:
             delete_fingerprint=await self._fingerprint_image_url(rendered_url),
             delete_image_signatures=await self._signatures_from_image_url(rendered_url),
         )
+
+    def _list_scope(self, event: Any) -> str | None:
+        """列出语录时的作用域：全局模式下为 None（所有会话）。"""
+        session_key = make_session_key(event.get_group_id(), event.get_sender_id())
+        return None if self.global_mode else session_key
+
+    def list_session_quotes(self, event: Any) -> list[Quote]:
+        """按创建时间升序列出当前作用域内的全部语录，编号即列表序号。"""
+        quotes = self.repository.list_all_quotes(self._list_scope(event))
+        return sorted(quotes, key=lambda item: (float(item.created_at or 0.0), str(item.id)))
+
+    def resolve_quote_by_index(self, event: Any, index: int) -> Quote | None:
+        quotes = self.list_session_quotes(event)
+        if index < 1 or index > len(quotes):
+            return None
+        return quotes[index - 1]
+
+    @staticmethod
+    def _quote_badge(quote: Quote) -> str:
+        marks: list[str] = []
+        if str(quote.kind or "").strip() == "forward":
+            marks.append("聊天记录")
+        if quote.image_ids:
+            marks.append(f"图{len(quote.image_ids)}")
+        if quote.media_ids:
+            marks.append("媒体")
+        return f"［{'·'.join(marks)}］" if marks else ""
+
+    @staticmethod
+    def quote_preview(
+        quote: Quote,
+        limit: int = QUOTE_LIST_PREVIEW_LIMIT,
+        include_placeholder: bool = True,
+    ) -> str:
+        """取一条语录的纯文本预览。"""
+        text = normalize_quote_text(quote.text or "")
+        if not text and quote.segments:
+            parts = [normalize_quote_text(segment.text or "") for segment in quote.segments]
+            text = " ".join(item for item in parts if item)
+        if not text and quote.forward_nodes:
+            text = f"聊天记录 {len(quote.forward_nodes)} 条"
+        if not text and include_placeholder:
+            if quote.image_ids:
+                text = f"{len(quote.image_ids)} 张图片"
+            elif quote.media_ids:
+                text = "媒体文件"
+        text = " ".join(str(text).split())
+        if len(text) > limit:
+            text = text[:limit] + "…"
+        return text
+
+    async def list_quotes(
+        self,
+        event: Any,
+        page: int = 1,
+        page_size: int = QUOTE_LIST_PAGE_SIZE,
+        *,
+        label: str = "入典语录",
+        upload_command: str = "上传",
+        list_command: str = "语录列表",
+    ) -> CommandResponse:
+        """生成入典语录清单（分页、带编号，便于按编号删除）。"""
+        from datetime import datetime
+
+        quotes = self.list_session_quotes(event)
+        if not quotes:
+            scope_hint = "" if self.global_mode else "本会话"
+            return CommandResponse(
+                kind="plain",
+                text=f"{scope_hint}还没有{label}，先用 {upload_command} 保存一条吧~",
+            )
+
+        total = len(quotes)
+        page_size = max(1, int(page_size))
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(1, int(page or 1))
+        if page > total_pages:
+            return CommandResponse(
+                kind="plain",
+                text=f"{label}共 {total} 条，只有 {total_pages} 页哦，发 {list_command} {total_pages} 看看最后一页~",
+            )
+
+        start = (page - 1) * page_size
+        end = min(start + page_size, total)
+        header = f"📚 {label} 共 {total} 条"
+        if total_pages > 1:
+            header += f" · 第 {page}/{total_pages} 页"
+        lines: list[str] = [header, "─" * 14]
+        for offset in range(start, end):
+            quote = quotes[offset]
+            created = float(quote.created_at or 0.0)
+            stamp = datetime.fromtimestamp(created).strftime("%m-%d %H:%M") if created else "时间未知"
+            name = str(quote.name or "").strip() or str(quote.qq or "").strip() or "未知"
+            if len(name) > 12:
+                name = name[:12] + "…"
+            lines.append(f"{offset + 1}. {name} {stamp}{self._quote_badge(quote)}")
+            preview = self.quote_preview(quote, include_placeholder=False)
+            if preview:
+                lines.append(f"    「{preview}」")
+        lines.append("─" * 14)
+        if page < total_pages:
+            lines.append(f"下一页：{list_command} {page + 1}")
+        elif page > 1:
+            lines.append(f"上一页：{list_command} {page - 1}")
+        delete_command = "删除涩图" if list_command.startswith("涩图") else "删除"
+        if delete_command == "删除涩图":
+            lines.append(f"删除：直接发「{delete_command} 编号」")
+        else:
+            lines.append(f"删除：直接发「{delete_command} 编号」，或回复机器人发的那条语录后发「删除」")
+        logger.info(f"语录列表输出: label={label}, total={total}, page={page}/{total_pages}")
+        return CommandResponse(kind="plain", text="\n".join(lines))
 
     async def delete_quote(self, quote_id: str) -> bool:
         return await self.repository.delete_quote(quote_id)

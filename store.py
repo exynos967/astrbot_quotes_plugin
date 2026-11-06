@@ -233,6 +233,14 @@ class QuoteRepository:
     def list_quotes(self, session_key: str) -> list[Quote]:
         return self.get_store(session_key).load_quotes()
 
+    def list_all_quotes(self, session_key: str | None = None) -> list[Quote]:
+        """列出指定会话（None 表示全部会话）中的语录。"""
+        keys = self.session_keys() if session_key is None else [session_key]
+        quotes: list[Quote] = []
+        for key in keys:
+            quotes.extend(self.get_store(key).load_quotes())
+        return quotes
+
     def get_quote(self, session_key: str, quote_id: str) -> Quote | None:
         for quote in self.get_store(session_key).load_quotes():
             if quote.id == quote_id:

@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "display_name": "语录收藏"
+  },
+  "views": {
+    "quotes": {
+      "title": "语录管理台",
+      "description": "浏览普通池与涩图池的全部语录，支持筛选、搜索与单条删除。"
+    }
+  },
+  "pages": {
+    "quotes": {
+      "title": "语录管理台",
+      "description": "浏览普通池与涩图池的全部语录，支持筛选、搜索与单条删除。"
+    }
+  }
+}

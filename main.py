@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from time import time
 from typing import Any
 
@@ -14,7 +15,7 @@ except Exception:  # pragma: no cover
     AstrBotConfig = dict  # type: ignore
 
 try:
-    from .constants import PLUGIN_NAME
+    from .constants import NSFW_POOL_DIRNAME, NSFW_QUOTE_UPLOADED_MESSAGE, PLUGIN_NAME
     from .image_service import ImageService
     from .models import CommandResponse
     from .napcat_service import NapcatService
@@ -22,8 +23,9 @@ try:
     from .renderer import QuoteRenderer
     from .store import QuoteRepository
     from .utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
+    from .web_page import QuotesWebPage
 except ImportError:  # pragma: no cover
-    from constants import PLUGIN_NAME
+    from constants import NSFW_POOL_DIRNAME, NSFW_QUOTE_UPLOADED_MESSAGE, PLUGIN_NAME
     from image_service import ImageService
     from models import CommandResponse
     from napcat_service import NapcatService
@@ -31,6 +33,7 @@ except ImportError:  # pragma: no cover
     from renderer import QuoteRenderer
     from store import QuoteRepository
     from utils import ensure_plugin_data_dir, make_session_key, resolve_wake_prefixes
+    from web_page import QuotesWebPage
 
 
 @register(
@@ -47,6 +50,8 @@ class QuotesPlugin(Star):
         self.http_client = self._create_http_client()
         self.data_root = ensure_plugin_data_dir(str(self.config.get("storage") or "").strip(), PLUGIN_NAME)
         self.repository = QuoteRepository(self.data_root)
+        # 涩图语录：完全隔离的第二份存储（data 根下的 nsfw 子树），与普通语录互不干扰
+        self.repository_nsfw = QuoteRepository(self.data_root / NSFW_POOL_DIRNAME)
         self.napcat_service = NapcatService()
         self.image_service = ImageService(
             self.http_client,
@@ -65,14 +70,37 @@ class QuotesPlugin(Star):
             image_signature_use_group=bool(self.config.get("image_signature_use_group", False)),
             blacklist=self._parse_blacklist(),
         )
+        self.quote_service_nsfw = QuoteService(
+            repository=self.repository_nsfw,
+            image_service=self.image_service,
+            napcat_service=self.napcat_service,
+            renderer=self.renderer,
+            http_client=self.http_client,
+            global_mode=bool(self.config.get("global_mode", False)),
+            text_mode=bool((self.config.get("performance") or {}).get("text_mode", False)),
+            render_cache=bool((self.config.get("performance") or {}).get("render_cache", True)),
+            image_signature_use_group=bool(self.config.get("image_signature_use_group", False)),
+            blacklist=self._parse_blacklist(),
+        )
         self._cfg_poke_enabled = bool(self.config.get("poke_enabled", False))
         self._cfg_poke_probability = self._parse_probability(self.config.get("poke_probability", 20))
         self._cfg_poke_group_whitelist = self._parse_id_set(self.config.get("poke_group_whitelist") or [])
         self._cfg_poke_group_blacklist = self._parse_id_set(self.config.get("poke_group_blacklist") or [])
+        self.web_page = QuotesWebPage(self)
 
     async def initialize(self):
         await self.repository.migrate_legacy_data()
-        await self.renderer.warmup()
+        self.web_page.register()
+        # 渲染服务预热要联网，耗时可能几十秒；放到后台跑，别拖慢 AstrBot 启动。
+        self._warmup_task = asyncio.create_task(self._warmup_renderer())
+
+    async def _warmup_renderer(self) -> None:
+        try:
+            await self.renderer.warmup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 预热失败不影响功能
+            logger.debug(f"渲染服务预热失败（可忽略）: {type(exc).__name__}: {exc}")
 
     async def terminate(self):
         if self.http_client is not None:
@@ -83,43 +111,142 @@ class QuotesPlugin(Star):
 
     @filter.command("上传")
     async def add_quote(self, event: AstrMessageEvent, uid: str = ""):
+        """保存语录：回复要收藏的消息后发送「上传」，可用「上传 @某人」或「上传 QQ号」指定归属。"""
         response = await self.quote_service.add_quote(event, uid=uid)
         for item in self._emit_response(event, response):
             yield item
 
+    @filter.command("上传涩图", alias={"上传NSFW", "上传nsfw"})
+    async def add_nsfw_quote(self, event: AstrMessageEvent, uid: str = ""):
+        """保存涩图：与「上传」相同，但存进完全隔离的涩图池，两边互不可见。"""
+        response = await self.quote_service_nsfw.add_quote(
+            event,
+            uid=uid,
+            command_name="上传涩图",
+            success_message=NSFW_QUOTE_UPLOADED_MESSAGE,
+        )
+        for item in self._emit_response(event, response, pool="nsfw"):
+            yield item
+
+    @filter.command("涩图", alias={"涩图语录"})
+    async def random_nsfw_quote(self, event: AstrMessageEvent, uid: str = ""):
+        """随机一条涩图：从涩图池随机抽一条，可用「涩图 @某人」指定对象。"""
+        response = await self.quote_service_nsfw.random_quote(
+            event,
+            uid=uid,
+            silent_if_empty=False,
+            noun="涩图语录",
+            upload_command="上传涩图",
+        )
+        for item in self._emit_response(event, response, pool="nsfw"):
+            yield item
+
+    @filter.command("涩图列表", alias={"涩图清单"})
+    async def list_nsfw_quotes(self, event: AstrMessageEvent, page: str = ""):
+        """涩图清单：分页列出涩图池的全部条目（带编号，可发「涩图列表 2」翻页）。"""
+        response = await self.quote_service_nsfw.list_quotes(
+            event,
+            page=self._parse_page(page),
+            label="涩图语录",
+            upload_command="上传涩图",
+            list_command="涩图列表",
+        )
+        for item in self._emit_response(event, response, pool="nsfw"):
+            yield item
+
+    @filter.command("删除涩图")
+    async def delete_nsfw_quote(self, event: AstrMessageEvent, index: str = ""):
+        """删除涩图：发「删除涩图 编号」，编号取自涩图列表（受删除权限限制）。"""
+        if not await self._check_delete_permission(event):
+            yield event.plain_result("权限不足：你无权使用删除语录指令。")
+            return
+        target_index = self._parse_page(index)
+        if not target_index:
+            yield event.plain_result("用法：删除涩图 编号（编号来自 涩图列表）")
+            return
+        quote = self.quote_service_nsfw.resolve_quote_by_index(event, target_index)
+        if quote is None:
+            yield event.plain_result(f"第 {target_index} 条涩图不存在，先发「涩图列表」看看编号吧~")
+            return
+        preview = self.quote_service_nsfw.quote_preview(quote, limit=20)
+        deleted = await self.quote_service_nsfw.delete_quote(quote.id)
+        if deleted:
+            suffix = f"（{preview}）" if preview else ""
+            yield event.plain_result(f"已删除第 {target_index} 条涩图{suffix}。")
+        else:
+            yield event.plain_result("未找到该涩图，可能已被删除。")
+
     @filter.command("语录")
     async def random_quote(self, event: AstrMessageEvent, uid: str = ""):
+        """随机一条语录：从普通语录池随机抽一条，可用「语录 @某人」指定对象。"""
         response = await self.quote_service.random_quote(event, uid=uid, silent_if_empty=False)
         for item in self._emit_response(event, response):
             yield item
 
+    @filter.command("语录列表", alias={"入典", "入典列表", "语录清单"})
+    async def list_quotes(self, event: AstrMessageEvent, page: str = ""):
+        """语录清单：分页列出普通池全部语录（带编号，可发「语录列表 2」翻页）。"""
+        response = await self.quote_service.list_quotes(event, page=self._parse_page(page))
+        for item in self._emit_response(event, response):
+            yield item
+
     @filter.command("删除", alias={"删除语录"})
-    async def delete_quote(self, event: AstrMessageEvent):
+    async def delete_quote(self, event: AstrMessageEvent, index: str = ""):
+        """删除语录：发「删除 编号」，或回复机器人发出的那条语录后发「删除」（受删除权限限制）。"""
         if not await self._check_delete_permission(event):
             yield event.plain_result("权限不足：你无权使用删除语录指令。")
             return
+
+        target_index = self._parse_page(index)
+        if target_index:
+            quote = self.quote_service.resolve_quote_by_index(event, target_index)
+            if quote is None:
+                yield event.plain_result(f"第 {target_index} 条不存在，先发「语录列表」看看编号吧~")
+                return
+            preview = self.quote_service.quote_preview(quote, limit=20)
+            deleted = await self.quote_service.delete_quote(quote.id)
+            if deleted:
+                suffix = f"（{preview}）" if preview else ""
+                yield event.plain_result(f"已删除第 {target_index} 条语录{suffix}。")
+            else:
+                yield event.plain_result("未找到该语录，可能已被删除。")
+            return
+
         if self.quote_service.get_reply_message_id(event) is None:
-            yield event.plain_result("请先『回复机器人发送的语录』，再发送 删除。")
+            yield event.plain_result("请先『回复机器人发送的语录』，再发送 删除；也可以直接发『删除 编号』。")
             return
 
         quote_id = await self.quote_service.resolve_delete_target(event)
+        target_service = self.quote_service
+        target_pool = "normal"
+        if not quote_id:
+            # 回复的可能是涩图池里的语录，隔离池各自查一次
+            quote_id = await self.quote_service_nsfw.resolve_delete_target(event)
+            target_service = self.quote_service_nsfw
+            target_pool = "nsfw"
         if not quote_id:
             yield event.plain_result("未能定位到你回复的那条语录，请确认回复的是机器人发送的语录消息。")
             return
 
-        deleted = await self.quote_service.delete_quote(quote_id)
+        deleted = await target_service.delete_quote(quote_id)
         if deleted:
-            yield event.plain_result("已删除语录。")
+            yield event.plain_result("已删除涩图语录。" if target_pool == "nsfw" else "已删除语录。")
         else:
             yield event.plain_result("未找到该语录，可能已被删除。")
 
     @filter.command("语录帮助")
     async def help_quote(self, event: AstrMessageEvent):
+        """语录帮助：列出语录插件的全部指令与用法说明。"""
         help_text = (
             "语录插件帮助\n"
             "- 上传：回复消息后发送，保存为语录；可用“上传 @某人”或“上传 QQ号”指定归属。\n"
             "- 语录：随机发送语录；可用“语录 @某人”或“语录 QQ号”指定用户。\n"
-            "- 删除 / 删除语录：回复机器人发送的语录后删除。\n"
+            "- 语录列表 / 入典：查看全部入典语录（带编号，可翻页）。\n"
+            "- 删除 / 删除语录：回复机器人发送的语录后删除，或直接发“删除 编号”。\n"
+            "- 上传涩图：把消息存进独立隔离的涩图池（与普通语录互不影响）。\n"
+            "- 涩图：随机发送涩图池里的语录。\n"
+            "- 涩图列表：查看涩图池清单（带编号）。\n"
+            "- 删除涩图：删除涩图池里的第 N 条。\n"
             "- 语录帮助：查看本帮助。"
         )
         yield event.plain_result(help_text)
@@ -158,24 +285,34 @@ class QuotesPlugin(Star):
             quote_id = str(event.get_extra("_quotes_sent_quote_id", "") or "")
             fingerprint = str(event.get_extra("_quotes_sent_fingerprint", "") or "")
             if quote_id and fingerprint:
-                await self.repository.record_sent_quote(
+                pool = str(event.get_extra("_quotes_sent_pool", "normal") or "normal")
+                repository = self.repository_nsfw if pool == "nsfw" else self.repository
+                await repository.record_sent_quote(
                     self._session_key(event),
                     quote_id=quote_id,
                     fingerprint=fingerprint,
                     sent_at=time(),
                     image_signatures=event.get_extra("_quotes_sent_image_signatures", default=[]),
                 )
-                logger.info(f"已记录语录发送索引: quote_id={quote_id}, session={self._session_key(event)}")
+                logger.info(
+                    f"已记录语录发送索引: pool={pool}, quote_id={quote_id}, session={self._session_key(event)}"
+                )
         except Exception as exc:
             logger.info(f"after_message_sent 记录失败: {exc}")
 
-    def _emit_response(self, event: AstrMessageEvent, response: CommandResponse | None):
+    def _emit_response(
+        self,
+        event: AstrMessageEvent,
+        response: CommandResponse | None,
+        pool: str = "normal",
+    ):
         if response is None or response.kind == "none":
             return
         if response.quote_id and response.delete_fingerprint:
             event.set_extra("_quotes_sent_quote_id", response.quote_id)
             event.set_extra("_quotes_sent_fingerprint", response.delete_fingerprint)
             event.set_extra("_quotes_sent_image_signatures", response.delete_image_signatures)
+            event.set_extra("_quotes_sent_pool", pool)
         if response.kind == "plain":
             yield event.plain_result(response.text)
             return
@@ -230,6 +367,17 @@ class QuotesPlugin(Star):
                 if value.isdigit() and len(value) >= 5:
                     items.add(value)
         return items
+
+    def _parse_page(self, value: Any) -> int:
+        """解析页码 / 编号参数；非法或空值返回 0（表示未指定）。"""
+        text = str(value or "").strip()
+        digits = "".join(char for char in text if char.isdigit())
+        if not digits:
+            return 0
+        try:
+            return max(0, int(digits[:6]))
+        except ValueError:
+            return 0
 
     def _parse_probability(self, value: Any) -> int:
         try:

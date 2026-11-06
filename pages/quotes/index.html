@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>语录管理台</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <div class="logo">📚</div>
+      <div>
+        <h1>语录管理台</h1>
+        <p id="subtitle">读取中…</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button id="open-style" class="button secondary" type="button">🎨 卡片样式</button>
+      <button id="refresh" class="button secondary" type="button">↻ 刷新</button>
+    </div>
+  </header>
+
+  <nav class="tabs" aria-label="语录池切换">
+    <button class="tab active" data-pool="normal" type="button">普通语录 <span id="count-normal" class="pill">0</span></button>
+    <button class="tab" data-pool="nsfw" type="button">涩图语录 <span id="count-nsfw" class="pill">0</span></button>
+  </nav>
+
+  <section class="toolbar">
+    <label class="field">
+      <span>会话</span>
+      <select id="session-select">
+        <option value="all">全部会话</option>
+      </select>
+    </label>
+    <label class="field grow">
+      <span>搜索</span>
+      <input id="search-input" type="search" placeholder="按名字 / QQ / 内容筛选">
+    </label>
+    <label class="field">
+      <span>每页</span>
+      <select id="page-size">
+        <option value="12">12</option>
+        <option value="24">24</option>
+        <option value="48">48</option>
+      </select>
+    </label>
+  </section>
+
+  <main id="list" class="grid" aria-live="polite"></main>
+
+  <footer class="footer">
+    <button id="prev" class="button secondary" type="button">← 上一页</button>
+    <span id="page-info" class="page-info">— / —</span>
+    <button id="next" class="button secondary" type="button">下一页 →</button>
+  </footer>
+
+  <!-- 单条语录渲染预览 -->
+  <div id="preview-modal" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h2 id="preview-title">渲染预览</h2>
+        <button id="preview-close" class="button ghost icon" type="button" aria-label="关闭">✕</button>
+      </header>
+      <div class="modal-body">
+        <div id="preview-loading" class="loading">渲染中…</div>
+        <img id="preview-img" alt="渲染预览" hidden>
+        <p id="preview-text" class="preview-text"></p>
+      </div>
+      <footer class="modal-foot">
+        <button id="preview-reload" class="button secondary" type="button">重新渲染</button>
+        <button id="preview-download" class="button secondary" type="button">下载图片</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 卡片样式抽屉 -->
+  <aside id="style-drawer" class="drawer" hidden>
+    <header class="drawer-head">
+      <h2>卡片样式</h2>
+      <button id="style-close" class="button ghost icon" type="button" aria-label="关闭">✕</button>
+    </header>
+    <div class="drawer-body">
+      <div class="style-preview">
+        <div id="style-preview-hint" class="style-preview-hint">调整下面的选项，这里会实时预览</div>
+        <img id="style-preview-img" alt="样式预览" hidden>
+      </div>
+
+      <label class="field">
+        <span>背景图</span>
+        <input id="style-bg-file" type="file" accept="image/*">
+      </label>
+      <div class="row">
+        <input id="style-bg-url" type="text" placeholder="或填图片 URL / 本地路径">
+        <button id="style-bg-clear" class="button ghost" type="button">清除</button>
+      </div>
+
+      <div class="row">
+        <label class="field"><span>背景色</span><input id="style-bg-color" type="color"></label>
+        <input id="style-bg-color-text" class="color-text" type="text" spellcheck="false">
+      </div>
+      <div class="row">
+        <label class="field"><span>文字颜色</span><input id="style-text-color" type="color"></label>
+        <input id="style-text-color-text" class="color-text" type="text" spellcheck="false">
+      </div>
+
+      <label class="field">
+        <span>字号 <b id="style-font-scale-value">100%</b></span>
+        <input id="style-font-scale" type="range" min="60" max="180" step="5">
+      </label>
+      <label class="field">
+        <span>背景图遮罩 <b id="style-overlay-value">45%</b></span>
+        <input id="style-overlay" type="range" min="0" max="90" step="5">
+      </label>
+
+      <div class="row">
+        <label class="field"><span>宽度 px</span><input id="style-width" type="number" min="480" max="2560" step="10"></label>
+        <label class="field"><span>高度 px</span><input id="style-height" type="number" min="240" max="1440" step="10"></label>
+      </div>
+
+      <label class="field">
+        <span>字体栈（CSS）</span>
+        <input id="style-font-family" type="text" spellcheck="false">
+      </label>
+    </div>
+    <footer class="drawer-foot">
+      <button id="style-save" class="button primary" type="button">保存样式</button>
+      <button id="style-reset" class="button secondary" type="button">恢复默认</button>
+      <button id="style-clear-cache" class="button ghost" type="button">清空渲染缓存</button>
+    </footer>
+  </aside>
+
+  <div id="toast" class="toast" role="status" aria-live="assertive"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

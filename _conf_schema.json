@@ -74,6 +74,24 @@
         "default": "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'WenQuanYi Micro Hei', Arial, sans-serif",
         "description": "字体",
         "hint": "CSS 字体栈格式，支持多个字体回退"
+      },
+      "font_scale": {
+        "type": "int",
+        "default": 100,
+        "description": "字号缩放（百分比）",
+        "hint": "100 为原始大小，范围 50-200"
+      },
+      "bg_image": {
+        "type": "string",
+        "default": "",
+        "description": "背景图片",
+        "hint": "支持 http(s) 链接、data URL 或本地绝对路径；留空则使用纯色背景"
+      },
+      "bg_image_overlay": {
+        "type": "int",
+        "default": 45,
+        "description": "背景图暗化程度",
+        "hint": "0-95，数值越大文字越清晰"
       }
     }
   },

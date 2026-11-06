@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "display_name": "Quote Collector"
+  },
+  "views": {
+    "quotes": {
+      "title": "Quote Manager",
+      "description": "Browse every saved quote in both the normal and the NSFW pool, with filters, search and single-item deletion."
+    }
+  },
+  "pages": {
+    "quotes": {
+      "title": "Quote Manager",
+      "description": "Browse every saved quote in both the normal and the NSFW pool, with filters, search and single-item deletion."
+    }
+  }
+}
