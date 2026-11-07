@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import html
+import io
 import re
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+try:
+    from astrbot.api import logger
+except Exception:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 try:
     from .models import Quote
@@ -19,6 +29,9 @@ DEFAULT_FONT_FAMILY = (
     "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', "
     "'Microsoft YaHei', 'WenQuanYi Micro Hei', Arial, sans-serif"
 )
+
+RENDER_TIMEOUT_SECONDS = 45
+MAX_QUOTE_IMAGES = 4
 
 STYLE_DEFAULTS: dict[str, Any] = {
     "width": 1280,
@@ -135,6 +148,44 @@ def inline_bg_image(value: Any) -> str:
         return ""
 
 
+def inline_quote_image(value: Any, max_width: int = 720, quality: int = 82) -> str:
+    """把语录配图压成 data URL，供远端渲染服务引用。
+
+    远端服务读不到本机路径，原图动辄几百 KB 也会让模板爆掉，
+    所以先缩到 max_width 再转 base64。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered.startswith("data:"):
+        return text
+    if lowered.startswith(("http://", "https://")):
+        return text
+
+    path: Path | None
+    if lowered.startswith("file://"):
+        path = _file_uri_to_path(text)
+    else:
+        path = Path(text)
+    if path is None or not path.is_file():
+        return ""
+
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            if image.width > max_width:
+                ratio = max_width / float(image.width)
+                image = image.resize((max_width, max(1, int(image.height * ratio))))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality)
+        return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:  # noqa: BLE001 - 单张图失败不影响整张卡片
+        return ""
+
+
 def resolve_style(base: dict[str, Any] | None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """合并默认值 + 基础样式 + 覆盖项，产出可直接用于渲染的样式字典。"""
     merged: dict[str, Any] = dict(STYLE_DEFAULTS)
@@ -175,12 +226,27 @@ class QuoteRenderer:
         options: dict[str, Any] | None = None,
         return_url: bool = True,
     ) -> str:
-        return await self._html_render(
-            template,
-            data,
-            return_url,
-            options,
-        )
+        # 远端渲染服务偶发卡死时，aiohttp 默认要等到 300s 才超时，聊天场景等不起。
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                self._html_render(
+                    template,
+                    data,
+                    return_url,
+                    options,
+                ),
+                timeout=RENDER_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.warning(
+                f"渲染耗时超过 {RENDER_TIMEOUT_SECONDS}s（已放弃），请检查 t2i 服务"
+            )
+            raise RuntimeError(
+                f"渲染超时（>{RENDER_TIMEOUT_SECONDS}s），渲染服务可能不可用"
+            ) from exc
+        logger.debug(f"渲染完成，耗时 {time.monotonic() - started:.2f}s")
+        return result
 
     async def warmup(self) -> None:
         minimal = '<div style="width:320px;height:120px;background:#000;color:#fff">init</div>'
@@ -248,6 +314,7 @@ class QuoteRenderer:
         signature: str,
         style: dict[str, Any] | None = None,
         return_url: bool = True,
+        images: list[str] | None = None,
     ) -> str:
         effective = resolve_style(self.image_config, style)
         width = effective["width"]
@@ -260,6 +327,12 @@ class QuoteRenderer:
         font_scale = effective["font_scale"] / 100.0
         # 本地文件要被远端渲染服务读到，只能内联成 data URL。
         bg_image_css = inline_bg_image(bg_image) if bg_image else ""
+        # 语录自带的配图同理：本地路径远端读不到，先压成 data URL。
+        gallery: list[str] = []
+        for item in (images or [])[:MAX_QUOTE_IMAGES]:
+            data_url = inline_quote_image(item)
+            if data_url:
+                gallery.append(data_url)
 
         avatar = f"https://q1.qlogo.cn/g?b=qq&nk={quote.qq}&s=640"
         layout = self._resolve_text_layout(quote.text)
@@ -288,6 +361,24 @@ class QuoteRenderer:
             right_background = ""
             overlay_css = ""
 
+        gallery_html = ""
+        if gallery:
+            inner = "".join(f'<img src="{url}" alt="" />' for url in gallery)
+            gallery_html = f'<div class="gallery">{inner}</div>'
+        if safe_text.strip():
+            text_html = (
+                '<div class="text"><span class="quote-mark">「</span>'
+                f'<span class="text-content">{safe_text}</span>'
+                '<span class="quote-mark">」</span></div>'
+            )
+        elif gallery:
+            text_html = ""
+        elif quote.media_ids:
+            text_html = '<div class="text"><span class="text-content">［媒体文件］</span></div>'
+        else:
+            text_html = '<div class="text"><span class="text-content">（这条语录没有文字内容）</span></div>'
+        max_image_height = max(180, int(height * 0.72))
+
         template = f"""
         <html>
         <head>
@@ -299,28 +390,29 @@ class QuoteRenderer:
                 .left {{ position:absolute; left:0; top:0; bottom:0; width:{int(width * 0.36)}px; overflow:hidden; z-index:0; }}
                 .left img {{ width:100%; height:100%; object-fit:cover; display:block; }}
                 .left .left-shade {{ position:absolute; inset:0; background: linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0.28) 58%, rgba(0,0,0,0.55) 100%); }}
-                .right {{ position:relative; margin-left:{int(width * 0.36)}px; width:{int(width * 0.64)}px; min-height:{height}px; padding:36px 0; background:{bg_color}; {right_background} display:flex; align-items:center; justify-content:center; text-align:center; z-index:2; }}
+                .right {{ position:relative; margin-left:{int(width * 0.36)}px; width:{int(width * 0.64)}px; min-height:{height}px; padding:36px 0 92px; background:{bg_color}; {right_background} display:flex; align-items:center; justify-content:center; text-align:center; z-index:2; }}
                 {overlay_css}
+                .stack {{ position:relative; z-index:1; display:flex; flex-direction:column; align-items:center; gap:{max(10, quote_gap + 6)}px; width:100%; max-width:{max_text_width}px; }}
+                .gallery {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:12px; width:100%; }}
+                .gallery img {{ max-width:100%; max-height:{max_image_height}px; border-radius:14px; object-fit:contain; background:rgba(0,0,0,0.25); }}
                 .text {{
                     position:relative;
                     z-index:1;
                     color:{text_color};
                     font-size:{font_size}px;
                     line-height:{layout["line_height"]};
-                    padding:0 {padding_x}px;
-                    max-width:{max_text_width}px;
-                    display:flex;
-                    align-items:center;
-                    justify-content:center;
-                    gap:{quote_gap}px;
+                    padding:0;
+                    width:100%;
+                    max-width:100%;
+                    display:block;
                     text-align:center;
+                    text-wrap:balance;
                 }}
                 .text-content {{
-                    display:block;
-                    max-width:100%;
+                    display:inline;
                     white-space:pre-wrap;
                     word-break:break-word;
-                    overflow-wrap:anywhere;
+                    overflow-wrap:break-word;
                 }}
                 .signature {{ position:absolute; right:44px; bottom:28px; color:rgba(255,255,255,0.82); font-size:{signature_size}px; font-weight:300; z-index:3; }}
                 .quote-mark {{ color:{text_color}; opacity:0.8; flex:0 0 auto; }}
@@ -345,10 +437,9 @@ class QuoteRenderer:
             <div class="root">
                 <div class="left"><img src="{avatar}" /><div class="left-shade"></div></div>
                 <div class="right">
-                    <div class="text">
-                        <span class="quote-mark">「</span>
-                        <div class="text-content">{safe_text}</div>
-                        <span class="quote-mark">」</span>
+                    <div class="stack">
+                        {gallery_html}
+                        {text_html}
                     </div>
                 </div>
                 <div class="fade-overlay"></div>

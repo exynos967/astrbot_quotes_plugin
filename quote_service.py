@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -327,7 +328,29 @@ class QuoteService:
             quote,
             use_group_signature=self.image_signature_use_group,
         )
-        rendered_url = await self.renderer.render_quote_image(quote, signature)
+        rendered_url = ""
+        render_error: Exception | None = None
+        render_images = self._render_image_paths(quote)
+        for attempt in range(2):
+            try:
+                rendered_url = await self.renderer.render_quote_image(
+                    quote, signature, images=render_images
+                )
+                break
+            except Exception as exc:  # 渲染依赖远端服务，任何异常都只降级不抛出
+                render_error = exc
+                logger.warning(f"语录渲染失败（第 {attempt + 1}/2 次）: {exc}")
+                if attempt == 0:
+                    await asyncio.sleep(0.8)
+        if not rendered_url:
+            text = self._quote_plain_fallback(quote)
+            logger.warning(f"渲染服务不可用，已降级为文字回复: {render_error}")
+            return CommandResponse(
+                kind="plain",
+                text=text,
+                quote_id=quote.id,
+                delete_fingerprint=self._fingerprint_plain_text(text),
+            )
         cached = await self.cache_rendered_result(rendered_url, cache_path)
         if cached:
             return CommandResponse(
@@ -344,6 +367,20 @@ class QuoteService:
             delete_fingerprint=await self._fingerprint_image_url(rendered_url),
             delete_image_signatures=await self._signatures_from_image_url(rendered_url),
         )
+
+    def _render_image_paths(self, quote: Quote, limit: int = 4) -> list[str]:
+        """取这条语录的配图绝对路径，供渲染卡片时内联进模板。"""
+        if not quote.image_ids:
+            return []
+        paths: list[str] = []
+        for asset_id in quote.image_ids[:limit]:
+            asset = self.repository.find_asset(quote.group, asset_id)
+            if asset is None:
+                continue
+            abs_path = self.repository.root / asset.rel_path
+            if abs_path.is_file():
+                paths.append(str(abs_path))
+        return paths
 
     def _list_scope(self, event: Any) -> str | None:
         """列出语录时的作用域：全局模式下为 None（所有会话）。"""

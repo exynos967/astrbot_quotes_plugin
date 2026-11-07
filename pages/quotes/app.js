@@ -172,9 +172,61 @@
     }
   }
 
+  // 页面可能被嵌在 iframe 里，window.confirm 会被浏览器拦截（点了毫无反应），
+  // 所以自绘一个确认框。
+  function confirmDialog(message, options) {
+    const okText = (options && options.okText) || "确定";
+    const cancelText = (options && options.cancelText) || "取消";
+    return new Promise((resolve) => {
+      const back = document.createElement("div");
+      back.className = "confirm-backdrop";
+      const card = document.createElement("div");
+      card.className = "confirm-card";
+      const text = document.createElement("p");
+      text.className = "confirm-text";
+      text.textContent = message;
+      const actions = document.createElement("div");
+      actions.className = "confirm-actions";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "button ghost";
+      cancel.textContent = cancelText;
+      const ok = document.createElement("button");
+      ok.type = "button";
+      ok.className = "button primary danger";
+      ok.textContent = okText;
+      actions.appendChild(cancel);
+      actions.appendChild(ok);
+      card.appendChild(text);
+      card.appendChild(actions);
+      back.appendChild(card);
+
+      const close = (result) => {
+        document.removeEventListener("keydown", onKey, true);
+        back.remove();
+        resolve(result);
+      };
+      const onKey = (event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          close(false);
+        }
+      };
+      cancel.addEventListener("click", () => close(false));
+      ok.addEventListener("click", () => close(true));
+      back.addEventListener("click", (event) => {
+        if (event.target === back) close(false);
+      });
+      document.addEventListener("keydown", onKey, true);
+      document.body.appendChild(back);
+      ok.focus();
+    });
+  }
+
   async function remove(item, node) {
     const label = `${item.name}（#${item.index}）`;
-    if (!window.confirm(`确认删除这条语录吗？\n${label}`)) return;
+    const confirmed = await confirmDialog(`确认删除这条语录吗？\n${label}`, { okText: "删除" });
+    if (!confirmed) return;
     const button = node.querySelector(".delete");
     button.disabled = true;
     button.textContent = "删除中…";
@@ -187,6 +239,7 @@
       button.disabled = false;
       button.textContent = "删除";
       toast(`删除失败：${error && error.message ? error.message : error}`, "error");
+      window.console.error("[quotes] 删除失败", error);
     }
   }
 

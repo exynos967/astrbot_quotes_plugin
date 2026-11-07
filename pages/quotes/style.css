@@ -1,4 +1,4 @@
-﻿/* ---- 全局：hidden 属性优先 ---- */
+/* ---- 全局：hidden 属性优先 ---- */
 [hidden] {
   display: none !important;
 }
@@ -668,4 +668,49 @@ body.drawer-open .grid {
 
 body.modal-open {
   overflow: hidden;
+}
+
+/* 自绘确认框（iframe 内 window.confirm 会被拦掉） */
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 8, 16, 0.62);
+  backdrop-filter: blur(2px);
+}
+
+.confirm-card {
+  width: min(360px, 92vw);
+  padding: 20px 20px 16px;
+  border-radius: 14px;
+  background: var(--panel, #161b22);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+.confirm-text {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  color: var(--text, #e6edf3);
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.button.danger {
+  background: #b52a2a;
+  border-color: #b52a2a;
+  color: #fff;
+}
+
+.button.danger:hover {
+  background: #c93333;
 }

@@ -295,6 +295,19 @@ class QuotesWebPage:
         renderer = getattr(self.plugin, "renderer", None)
         return resolve_style(getattr(renderer, "image_config", {}) or {})
 
+    @staticmethod
+    def _quote_image_paths(repo, session_key: str, quote, limit: int = 4) -> list[str]:
+        """取这条语录配图的绝对路径，交给渲染器内联进模板。"""
+        paths: list[str] = []
+        for asset_id in (quote.image_ids or [])[:limit]:
+            asset = repo.find_asset(session_key, asset_id)
+            if asset is None:
+                continue
+            abs_path = repo.root / asset.rel_path
+            if abs_path.is_file():
+                paths.append(str(abs_path))
+        return paths
+
     def _find_quote(self, pool: str, quote_id: str):
         repo = self._repo(pool)
         for key in repo.session_keys():
@@ -480,8 +493,12 @@ class QuotesWebPage:
             session, _index, quote = rows[0]
 
         signature = quote.name or quote.qq
+        repo = self._repo(pool)
+        render_images = self._quote_image_paths(repo, session, quote)
         try:
-            rendered = await renderer.render_quote_image(quote, signature, style_override, return_url=False)
+            rendered = await renderer.render_quote_image(
+                quote, signature, style_override, return_url=False, images=render_images
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"[quotes.page] 渲染失败 {quote.id}: {type(exc).__name__}: {exc}")
             return error_response(f"渲染失败：{type(exc).__name__}", status_code=500)
